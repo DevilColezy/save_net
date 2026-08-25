@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Deterministic policy rollout for HierarchicalTrendControlPolicy.
+"""Closed-loop deterministic rollout for the schema-v25 ViTFly policy.
 
 Examples:
     python3 rollout.py --list-tasks
-    python3 rollout.py --checkpoint best.pt --model-file model/model.py
+    python3 rollout.py --checkpoint best.pt
     python3 rollout.py --checkpoint best.pt --model-file model/model.py \
-        --tasks clear_straight,forced_left,narrow_gate
+        --tasks clear_straight,forced_left,continuous_5hz
 
-The suite uses fixed obstacle layouts and fixed start/goal states so results
-are reproducible and timeouts/collisions can be attributed to a known task.
+The suite uses reproducible obstacle layouts and includes fixed, abrupt-switch
+and continuous 5 Hz goals.  Its preprocessing is intentionally identical to
+``V25SequenceDataset``: uint16 centimetre depth divided by 5 m and the exact
+11-element state vector/scale stored in the checkpoint.
 """
 
 import argparse
@@ -43,6 +45,18 @@ else:
     _IL_IMPORT_ERROR = None
 
 
+SCHEMA_VERSION = 25
+EXPECTED_ARCHITECTURE = "ViTFlyLSTMPolicy"
+EXPECTED_STATE_FIELDS = (
+    "gravity_flu_x", "gravity_flu_y", "gravity_flu_z",
+    "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
+    "yaw_rate_flu", "goal_direction_flu_x", "goal_direction_flu_y",
+    "goal_direction_flu_z", "goal_distance_norm",
+)
+DEFAULT_STATE_SCALE = (1.0, 1.0, 1.0, 2.5, 2.5, 2.5, 1.5,
+                       1.0, 1.0, 1.0, 1.0)
+
+
 def _load_model_from_file(model_file: str) -> Tuple[Any, Any]:
     model_path = Path(model_file).resolve()
     if not model_path.is_file():
@@ -55,13 +69,63 @@ def _load_model_from_file(model_file: str) -> Tuple[Any, Any]:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    MC = getattr(module, "HierarchicalTrendControlPolicy", None)
-    CC = getattr(module, "TrendControlConfig", None)
+    MC = getattr(module, "ViTFlyLSTMPolicy", None)
+    CC = getattr(module, "ViTFlyPolicyConfig", None)
     if MC is None:
-        raise ImportError(f"{model_path} does not define HierarchicalTrendControlPolicy")
+        raise ImportError(f"{model_path} does not define ViTFlyLSTMPolicy")
     if CC is None:
-        raise ImportError(f"{model_path} does not define TrendControlConfig")
+        raise ImportError(f"{model_path} does not define ViTFlyPolicyConfig")
     return MC, CC
+
+
+def load_policy_checkpoint(checkpoint_file: str, model_file: str,
+                           device: torch.device,
+                           requested_depth_max_m: float = 5.0):
+    """Load and strictly validate one train.py schema-v25 checkpoint."""
+    MC, CC = _load_model_from_file(model_file)
+    try:
+        checkpoint = torch.load(
+            checkpoint_file, map_location=device, weights_only=False)
+    except TypeError:  # PyTorch versions before ``weights_only``
+        checkpoint = torch.load(checkpoint_file, map_location=device)
+    if int(checkpoint.get("schema_version", -1)) != SCHEMA_VERSION:
+        raise ValueError(
+            f"checkpoint schema_version must be {SCHEMA_VERSION}, got "
+            f"{checkpoint.get('schema_version')!r}")
+    if checkpoint.get("architecture") != EXPECTED_ARCHITECTURE:
+        raise ValueError(
+            f"checkpoint architecture must be {EXPECTED_ARCHITECTURE}, got "
+            f"{checkpoint.get('architecture')!r}")
+    checkpoint_fields = tuple(checkpoint.get("student_input_fields", ()))
+    expected_fields = ("depth_file",) + EXPECTED_STATE_FIELDS
+    if checkpoint_fields and checkpoint_fields != expected_fields:
+        raise ValueError(
+            "checkpoint student input order does not match schema-v25 rollout")
+    normalization = checkpoint.get("normalization") or {}
+    checkpoint_depth_max = float(normalization.get("depth_max_m", 5.0))
+    if abs(checkpoint_depth_max - requested_depth_max_m) > 1e-6:
+        raise ValueError(
+            f"requested depth_max_m={requested_depth_max_m} disagrees with "
+            f"checkpoint depth_max_m={checkpoint_depth_max}")
+    state_scale = tuple(float(value) for value in
+                        normalization.get("state_scale", DEFAULT_STATE_SCALE))
+    if len(state_scale) != 11 or min(state_scale) <= 0.0:
+        raise ValueError(
+            "checkpoint normalization.state_scale must have 11 positives")
+    config_dict = checkpoint.get("model_config") or {}
+    model_config = CC(**config_dict) if config_dict else CC()
+    model_config.validate()
+    model = MC(model_config)
+    if "model_state" not in checkpoint:
+        raise KeyError("schema-v25 checkpoint is missing model_state")
+    state_dict = checkpoint["model_state"]
+    model.load_state_dict({
+        key[len("_orig_mod."):] if key.startswith("_orig_mod.") else key: value
+        for key, value in state_dict.items()
+    }, strict=True)
+    model.to(device=device)
+    model.eval()
+    return model, model_config, state_scale
 
 
 def _yaw_from_quat_xyzw(q_xyzw: np.ndarray) -> float:
@@ -117,6 +181,9 @@ class RolloutConfig:
     # Collector: record_hz=30, control_hz=50
     model_hz: float = 30.0
     ctrl_hz: float = 50.0
+    # 0 keeps recurrent state for the complete episode. A positive value is
+    # an ablation only; normal schema-v25 inference must leave this at zero.
+    lstm_reset_interval: int = 0
     max_yaw_rate: float = 2.0
     max_episode_time: float = 30.0
     goal_tolerance_m: float = 0.30
@@ -124,7 +191,9 @@ class RolloutConfig:
     goal_hold_ticks: int = 3
     collision_confirm_frames: int = 1
     drone_radius: float = 0.3
-    safety_margin: float = 0.10
+    safety_margin: float = 0.30
+    minimum_surface_gap_m: float = 1.20
+    state_scale: Tuple[float, ...] = DEFAULT_STATE_SCALE
     device: str = "auto"
     repeats: int = 1
     verbose: bool = True
@@ -154,6 +223,10 @@ class RolloutTask:
     start_yaw: float
     obstacles: Tuple[Cylinder, ...] = ()
     max_episode_time: Optional[float] = None
+    # (simulation time in seconds, new local goal). The first entry may be at
+    # t=0.  ``goal`` remains the final endpoint used for success evaluation.
+    goal_updates: Tuple[Tuple[float, Tuple[float, float, float]], ...] = ()
+    suite: str = "basic"
 
 
 # il_dataset_config.yaml: scene_generation.obstacle_region and the primary
@@ -162,7 +235,7 @@ class RolloutTask:
 # full-length trajectory instead of responding to the current goal.
 COLLECTION_OBSTACLE_BOUNDS = (-7.0, 10.0, 0.0, 30.0, 0.0, 8.0)
 COLLECTION_START_BOUNDS = (-6.5, 9.5, -1.5, -0.5, 1.8, 2.2)
-ROLLOUT_GOAL_BOUNDS = (-6.5, 9.5, 18.5, 19.5, 1.8, 2.2)
+ROLLOUT_WORKSPACE_BOUNDS = (-6.5, 9.5, -1.5, 29.5, 1.8, 2.2)
 
 
 def _point_in_bounds(point: np.ndarray, bounds: Tuple[float, ...]) -> bool:
@@ -174,15 +247,25 @@ def _point_in_bounds(point: np.ndarray, bounds: Tuple[float, ...]) -> bool:
 
 
 def build_task_registry() -> Dict[str, RolloutTask]:
-    """Build deterministic 20 m tasks inside the collector's +Y workspace."""
+    """Build basic acceptance tasks plus clearly marked stress tasks.
+
+    Full-height cylinders and >=1.2 m surface gaps match collection.  The
+    default CLI runs only the basic suite; compound tasks are opt-in stress
+    tests and are not used to decide whether a newly trained policy loads.
+    """
     start = (0.0, -1.0, 2.0)
-    goal = (0.0, 19.0, 2.0)
+    goal = (0.0, 11.0, 2.0)
     # Match il_manager._get_current_initial_yaw(): navigation/camera forward is
     # Flightlib body +Y, so yaw=0 faces world +Y (not world +X).
     delta_x = goal[0] - start[0]
     delta_y = goal[1] - start[1]
     forward_yaw = math.atan2(delta_y, delta_x) - math.pi / 2.0
     forward_yaw = math.atan2(math.sin(forward_yaw), math.cos(forward_yaw))
+    continuous_updates = tuple(
+        (0.2 * index, (0.25 * math.sin(index * 0.20),
+                       min(11.0, 3.0 + 0.30 * index), 2.0))
+        for index in range(28)
+    ) + ((5.6, goal),)
     tasks = [
         RolloutTask(
             "clear_straight",
@@ -193,142 +276,103 @@ def build_task_registry() -> Dict[str, RolloutTask]:
             "center_pillar",
             "Symmetric single obstacle; tests stable side selection.",
             start, goal, forward_yaw,
-            (Cylinder(0.0, 9.0, 1.0),),
+            (Cylinder(0.0, 5.0, 0.60),),
         ),
         RolloutTask(
             "near_pillar",
             "Centered obstacle visible near takeoff; tests early visual response.",
             start, goal, forward_yaw,
-            (Cylinder(0.0, 4.0, 1.0),),
+            (Cylinder(0.0, 2.5, 0.45),),
         ),
         RolloutTask(
             "far_pillar",
             "Centered obstacle late in the route; tests response timing.",
             start, goal, forward_yaw,
-            (Cylinder(0.0, 14.0, 1.0),),
+            (Cylinder(0.0, 8.0, 0.80),),
         ),
         RolloutTask(
             "offset_left",
             "Obstacle on body-left (-X); expected detour is body-right (+X).",
             start, goal, forward_yaw,
-            (Cylinder(-0.70, 9.0, 1.0),),
+            (Cylinder(-0.55, 5.0, 0.55),),
         ),
         RolloutTask(
             "offset_right",
             "Obstacle on body-right (+X); expected detour is body-left (-X).",
             start, goal, forward_yaw,
-            (Cylinder(0.70, 9.0, 1.0),),
+            (Cylinder(0.55, 5.0, 0.55),),
         ),
         RolloutTask(
             "forced_left",
             "Blocked body-right (+X); free detour is body-left (-X).",
             start, goal, forward_yaw,
-            (Cylinder(0.0, 9.0, 0.95),
-             Cylinder(1.65, 9.0, 0.75)),
+            (Cylinder(0.0, 5.0, 0.55),
+             Cylinder(2.35, 5.0, 0.55)),
         ),
         RolloutTask(
             "forced_right",
             "Blocked body-left (-X); free detour is body-right (+X).",
             start, goal, forward_yaw,
-            (Cylinder(0.0, 9.0, 0.95),
-             Cylinder(-1.65, 9.0, 0.75)),
+            (Cylinder(0.0, 5.0, 0.55),
+             Cylinder(-2.35, 5.0, 0.55)),
         ),
         RolloutTask(
             "wide_gate",
             "Comfortable gate; checks centered passage without oscillation.",
             start, goal, forward_yaw,
-            (Cylinder(-1.25, 9.0, 0.65),
-             Cylinder(1.25, 9.0, 0.65)),
+            (Cylinder(-1.30, 5.0, 0.65),
+             Cylinder(1.30, 5.0, 0.65)),
         ),
         RolloutTask(
-            "narrow_gate",
-            "0.9 m raw opening for a 0.6 m vehicle; precision stress test.",
-            start, goal, forward_yaw,
-            (Cylinder(-1.0, 9.0, 0.55),
-             Cylinder(1.0, 9.0, 0.55)),
+            "rear_goal",
+            "Goal starts behind the camera; tests turn-before-translation.",
+            (0.0, 7.0, 2.0), (0.0, 1.0, 2.0), forward_yaw,
         ),
         RolloutTask(
-            "gate_left",
-            "Wide gate centered on body-left; tests lateral goal correction.",
-            start, goal, forward_yaw,
-            (Cylinder(-2.25, 9.0, 0.65),
-             Cylinder(0.25, 9.0, 0.65)),
+            "abrupt_goal_switch",
+            "One in-episode goal jump without resetting recurrent state.",
+            start, (1.5, 10.0, 2.0), forward_yaw, (), 30.0,
+            ((0.0, (-1.5, 6.0, 2.0)), (2.5, (1.5, 10.0, 2.0))),
         ),
         RolloutTask(
-            "gate_right",
-            "Wide gate centered on body-right; mirror of gate_left.",
-            start, goal, forward_yaw,
-            (Cylinder(-0.25, 9.0, 0.65),
-             Cylinder(2.25, 9.0, 0.65)),
+            "continuous_5hz",
+            "Smooth local goal updates at 5 Hz, matching planner integration.",
+            start, goal, forward_yaw, (), 30.0, continuous_updates,
         ),
         RolloutTask(
             "two_stage_lr",
             "Body-left obstacle followed by body-right obstacle.",
             start, goal, forward_yaw,
-            (Cylinder(-0.75, 6.0, 0.90),
-             Cylinder(0.75, 12.0, 0.90)),
+            (Cylinder(-0.75, 4.0, 0.60),
+             Cylinder(0.75, 8.0, 0.60)),
+            35.0, (), "stress",
         ),
         RolloutTask(
             "two_stage_rl",
             "Body-right obstacle followed by body-left obstacle; mirrored test.",
             start, goal, forward_yaw,
-            (Cylinder(0.75, 6.0, 0.90),
-             Cylinder(-0.75, 12.0, 0.90)),
+            (Cylinder(0.75, 4.0, 0.60),
+             Cylinder(-0.75, 8.0, 0.60)),
+            35.0, (), "stress",
         ),
         RolloutTask(
             "double_gate",
             "Two oppositely shifted gates require a mid-route correction.",
             start, goal, forward_yaw,
-            (Cylinder(-2.05, 6.0, 0.60),
-             Cylinder(0.45, 6.0, 0.60),
-             Cylinder(-0.45, 12.0, 0.60),
-             Cylinder(2.05, 12.0, 0.60)),
-        ),
-        RolloutTask(
-            "funnel",
-            "A wide entrance narrows into a centered precision gate.",
-            start, goal, forward_yaw,
-            (Cylinder(-2.0, 6.0, 0.65),
-             Cylinder(2.0, 6.0, 0.65),
-             Cylinder(-1.0, 11.0, 0.55),
-             Cylinder(1.0, 11.0, 0.55)),
-        ),
-        RolloutTask(
-            "reverse_funnel",
-            "A narrow gate opens into a wide exit; mirror in route order.",
-            start, goal, forward_yaw,
-            (Cylinder(-1.0, 6.0, 0.55),
-             Cylinder(1.0, 6.0, 0.55),
-             Cylinder(-2.0, 11.0, 0.65),
-             Cylinder(2.0, 11.0, 0.65)),
+            (Cylinder(-1.30, 4.0, 0.60),
+             Cylinder(1.30, 4.0, 0.60),
+             Cylinder(-1.30, 8.0, 0.60),
+             Cylinder(1.30, 8.0, 0.60)),
+            35.0, (), "stress",
         ),
         RolloutTask(
             "slalom",
             "Alternating obstacles; tests repeated left/right decisions.",
             start, goal, forward_yaw,
-            (Cylinder(-0.75, 3.0, 0.80),
-             Cylinder(0.75, 7.0, 0.80),
-             Cylinder(-0.75, 11.0, 0.80),
-             Cylinder(0.75, 15.0, 0.80)),
-            40.0,
-        ),
-        RolloutTask(
-            "long_corridor",
-            "1.5 m raw corridor; tests drift and command smoothness.",
-            start, goal, forward_yaw,
-            tuple(
-                Cylinder(x, y, 0.55)
-                for y in (2.5, 6.0, 9.5, 13.0, 16.0)
-                for x in (-1.30, 1.30)
-            ),
-            40.0,
-        ),
-        RolloutTask(
-            "climb_over",
-            "Low wide obstacle forces a climb and return to collection height.",
-            start, goal, forward_yaw,
-            (Cylinder(0.0, 9.0, 2.0, height=1.6),),
-            40.0,
+            (Cylinder(-0.75, 2.5, 0.55),
+             Cylinder(0.75, 5.5, 0.55),
+             Cylinder(-0.75, 8.5, 0.55)),
+            40.0, (), "stress",
         ),
     ]
     return {task.name: task for task in tasks}
@@ -336,6 +380,7 @@ def build_task_registry() -> Dict[str, RolloutTask]:
 
 def validate_task_registry(
     tasks: Dict[str, RolloutTask], drone_radius: float, safety_margin: float,
+    minimum_surface_gap_m: float = 1.20,
 ) -> None:
     """Fail fast on malformed tasks or unsafe endpoints."""
     if not tasks:
@@ -350,12 +395,21 @@ def validate_task_registry(
             raise ValueError(f"Task {key}: start/goal must be finite")
         if np.linalg.norm(goal - start) < 1.0:
             raise ValueError(f"Task {key}: start and goal are too close")
-        if not _point_in_bounds(start, COLLECTION_START_BOUNDS):
-            raise ValueError(
-                f"Task {key}: start is outside the collection start region")
-        if not _point_in_bounds(goal, ROLLOUT_GOAL_BOUNDS):
-            raise ValueError(
-                f"Task {key}: goal is outside the shortened rollout goal region")
+        if not _point_in_bounds(start, ROLLOUT_WORKSPACE_BOUNDS):
+            raise ValueError(f"Task {key}: start is outside rollout workspace")
+        if not _point_in_bounds(goal, ROLLOUT_WORKSPACE_BOUNDS):
+            raise ValueError(f"Task {key}: goal is outside rollout workspace")
+        endpoints = [("start", start), ("goal", goal)]
+        previous_time = -1.0
+        for update_index, (update_time, update_goal) in enumerate(task.goal_updates):
+            update_point = np.asarray(update_goal, dtype=np.float64)
+            if update_time < 0.0 or update_time <= previous_time:
+                raise ValueError(f"Task {key}: goal update times must increase")
+            if not np.all(np.isfinite(update_point)) or not _point_in_bounds(
+                    update_point, ROLLOUT_WORKSPACE_BOUNDS):
+                raise ValueError(f"Task {key}: invalid goal update {update_index}")
+            endpoints.append((f"goal_update_{update_index}", update_point))
+            previous_time = update_time
         for obstacle in task.obstacles:
             if obstacle.radius <= 0.0 or obstacle.height <= 0.0:
                 raise ValueError(f"Task {key}: obstacle dimensions must be positive")
@@ -370,7 +424,7 @@ def validate_task_registry(
             ):
                 raise ValueError(
                     f"Task {key}: obstacle is outside collection bounds")
-            for label, endpoint in (("start", start), ("goal", goal)):
+            for label, endpoint in endpoints:
                 within_height = (
                     obstacle.base_z - clearance <= endpoint[2] <=
                     obstacle.base_z + obstacle.height + clearance
@@ -380,6 +434,20 @@ def validate_task_registry(
                 if within_height and planar_distance <= obstacle.radius + clearance:
                     raise ValueError(
                         f"Task {key}: {label} intersects an inflated obstacle")
+        for first_index, first in enumerate(task.obstacles):
+            for second in task.obstacles[first_index + 1:]:
+                vertical_overlap = not (
+                    first.base_z + first.height <= second.base_z or
+                    second.base_z + second.height <= first.base_z)
+                if not vertical_overlap:
+                    continue
+                center_distance = math.hypot(first.x - second.x,
+                                             first.y - second.y)
+                surface_gap = center_distance - first.radius - second.radius
+                if surface_gap + 1e-9 < minimum_surface_gap_m:
+                    raise ValueError(
+                        f"Task {key}: obstacle surface gap {surface_gap:.3f} m "
+                        f"is below {minimum_surface_gap_m:.3f} m")
 
 
 def task_to_unity_objects(
@@ -437,11 +505,8 @@ class EpisodeResult:
     max_inference_ms: float
     num_depth_timeouts: int
     num_frame_mismatches: int
-    normal_fraction: float
-    recover_left_fraction: float
-    recover_right_fraction: float
-    recovery_entry_count: int
-    max_consecutive_recovery: int
+    goal_switch_count: int
+    minimum_body_clearance_m: float
     avg_command_delta: float
 
 
@@ -472,20 +537,21 @@ class RolloutDataLogger:
         "next_x", "next_y", "next_z",
         "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
         "speed_world_mps", "yaw_rate_rps", "goal_distance_m",
+        "active_goal_x", "active_goal_y", "active_goal_z", "goal_switch_event",
         "guide_x", "guide_y", "guide_z", "guide_distance_norm",
+        "state_gravity_x", "state_gravity_y", "state_gravity_z",
+        "minimum_body_clearance_m",
         "depth_min_m", "depth_mean_m",
         "depth_near_1m_frac", "depth_near_2m_frac",
         "depth_near_3m_frac", "depth_near_4m_frac",
         "depth_left_near_4m_frac", "depth_center_near_4m_frac",
         "depth_right_near_4m_frac",
-        "horizontal_index", "vertical_index",
-        "guide_value_raw", "guide_value",
+        "normalized_cmd_vx", "normalized_cmd_vy", "normalized_cmd_vz",
+        "normalized_cmd_yaw_rate",
         "cmd_vx_flu", "cmd_vy_flu", "cmd_vz_flu", "cmd_yaw_rate",
         "inference_ms",
     ]
-    _HORIZONTAL_COLUMNS = [f"horizontal_prob_{index}" for index in range(13)]
-    _VERTICAL_COLUMNS = [f"vertical_prob_{index}" for index in range(7)]
-    COLUMNS = _BASE_COLUMNS + _HORIZONTAL_COLUMNS + _VERTICAL_COLUMNS
+    COLUMNS = _BASE_COLUMNS
 
     def __init__(self, prefix: str, metadata: Dict[str, Any]) -> None:
         prefix_path = Path(prefix).expanduser()
@@ -550,17 +616,87 @@ def compute_global_guide(
     return gf, dm, dn
 
 
-def preprocess_depth(
-    du16: np.ndarray, th: int, tw: int, dev: torch.device,
-) -> torch.Tensor:
-    d = torch.from_numpy(du16.astype(np.float32) / 65535.0)
-    if d.shape[0] != th or d.shape[1] != tw:
-        d = torch.nn.functional.interpolate(
-            d[None, None, ...], size=(th, tw), mode="area",
-        ).squeeze(0)
+def canonicalize_unity_depth(depth_payload: np.ndarray,
+                             max_depth_m: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply the collector/writer/loader depth contract exactly.
+
+    Unity's payload uses hectometres, hence the x100 conversion. Invalid,
+    zero and negative samples mean no return and are encoded as max range.
+    The writer rounds metres to uint16 centimetres; the loader multiplies by
+    0.01 and divides by max range.
+    """
+    depth_m = np.flipud(np.asarray(depth_payload, dtype=np.float32) * 100.0)
+    with np.errstate(invalid="ignore"):
+        valid = np.isfinite(depth_m) & (depth_m > 0.0)
+    depth_m = depth_m.copy()
+    depth_m[~valid] = float(max_depth_m)
+    depth_m = np.clip(depth_m, 0.0, float(max_depth_m))
+    depth_cm = np.round(depth_m * 100.0).astype(np.uint16)
+    normalized = np.clip(
+        depth_cm.astype(np.float32) * 0.01 / float(max_depth_m), 0.0, 1.0)
+    return depth_cm, normalized
+
+
+def preprocess_depth(depth_normalized: np.ndarray,
+                     dev: torch.device) -> torch.Tensor:
+    """Return [1,1,H,W]; model.step performs the training-size resize."""
+    if depth_normalized.ndim != 2:
+        raise ValueError("depth image must be two-dimensional")
+    return torch.from_numpy(depth_normalized.astype(np.float32))[None, None].to(
+        device=dev)
+
+
+def build_normalized_state(gravity_flu: np.ndarray,
+                           velocity_flu: np.ndarray, yaw_rate: float,
+                           goal_direction_flu: np.ndarray,
+                           goal_distance_norm: float,
+                           state_scale: Tuple[float, ...],
+                           device: torch.device) -> torch.Tensor:
+    """Construct the exact schema-v25 11-D student state in field order."""
+    raw = np.concatenate((
+        np.asarray(gravity_flu, dtype=np.float32).reshape(3),
+        np.asarray(velocity_flu, dtype=np.float32).reshape(3),
+        np.asarray([yaw_rate], dtype=np.float32),
+        np.asarray(goal_direction_flu, dtype=np.float32).reshape(3),
+        np.asarray([goal_distance_norm], dtype=np.float32),
+    ))
+    scale = np.asarray(state_scale, dtype=np.float32)
+    if raw.shape != (11,) or scale.shape != (11,) or np.any(scale <= 0.0):
+        raise ValueError("schema-v25 state and state_scale must contain 11 values")
+    if not np.isfinite(raw).all():
+        raise ValueError("non-finite schema-v25 rollout state")
+    return torch.from_numpy(raw / scale)[None].to(device=device)
+
+
+def active_goal_for_time(task: RolloutTask, sim_time_s: float,
+                         previous_index: int) -> Tuple[np.ndarray, int, bool]:
+    """Return the scheduled local goal without ever resetting the LSTM."""
+    if not task.goal_updates:
+        return np.asarray(task.goal, dtype=np.float64), -1, False
+    index = previous_index
+    for candidate in range(previous_index + 1, len(task.goal_updates)):
+        if task.goal_updates[candidate][0] <= sim_time_s + 1e-9:
+            index = candidate
+        else:
+            break
+    if index < 0:
+        goal = task.goal_updates[0][1]
     else:
-        d = d.unsqueeze(0)
-    return d.unsqueeze(0).to(device=dev)
+        goal = task.goal_updates[index][1]
+    return np.asarray(goal, dtype=np.float64), index, index != previous_index
+
+
+def body_clearance(position: np.ndarray, task: RolloutTask,
+                   drone_radius: float) -> float:
+    """Analytic clearance from vehicle surface to the nearest cylinder."""
+    values = []
+    for obstacle in task.obstacles:
+        if obstacle.base_z - drone_radius <= position[2] <= \
+                obstacle.base_z + obstacle.height + drone_radius:
+            values.append(math.hypot(position[0] - obstacle.x,
+                                     position[1] - obstacle.y) -
+                          obstacle.radius - drone_radius)
+    return min(values) if values else float("inf")
 
 
 def run_rollout(
@@ -582,7 +718,6 @@ def run_rollout(
         "far": rollout_cfg.depth_far,
     }
     ih, iw = rollout_cfg.depth_height, rollout_cfg.depth_width
-    mh, mw = model_cfg.image_size
     mr = rollout_cfg.depth_max_m
     sp = np.asarray(task.start, dtype=np.float64)
     gp = np.asarray(task.goal, dtype=np.float64)
@@ -649,13 +784,7 @@ def run_rollout(
                 depth_float = np.frombuffer(
                     raw_depth, dtype=np.float32,
                 ).reshape((ih, iw))
-                depth_m = np.flipud(depth_float * 100.0)
-                depth_m = np.nan_to_num(
-                    depth_m, nan=mr, posinf=mr, neginf=0.0,
-                )
-                warm_depth = np.clip(
-                    depth_m / mr * 65535.0, 0, 65535,
-                ).astype(np.uint16)
+                warm_depth, _ = canonicalize_unity_depth(depth_float, mr)
                 break
             if warm_depth is not None:
                 break
@@ -668,9 +797,7 @@ def run_rollout(
         gid += 1
 
     if rollout_cfg.verbose and last_warm_depth is not None:
-        warm_depth_m = (
-            last_warm_depth.astype(np.float32) * (mr / 65535.0)
-        )
+        warm_depth_m = last_warm_depth.astype(np.float32) * 0.01
         print(
             f"  [rollout] render warmup complete: "
             f"frames={rollout_cfg.render_warmup_frames} "
@@ -681,16 +808,25 @@ def run_rollout(
         )
 
     dt = torch.float32
-    ts = model.initial_state(model_cfg.trend_lstm_layers, 1, model_cfg.trend_lstm_hidden_dim, device, dt)
-    cs = model.initial_state(model_cfg.control_lstm_layers, 1, model_cfg.control_lstm_hidden_dim, device, dt)
+    hidden = model.initial_hidden(1, device=device, dtype=dt)
     rollout_start_position = dyn.get_state().position_world.copy()
     pp: List[np.ndarray] = [rollout_start_position]
     cf = 0; fcs = -1; mts: List[float] = []; ndt = 0; nfm = 0
-    tn, tl, tr = 0, 0, 0; rec = 0; wr = False; cr = 0; mcr = 0
     pc: Optional[np.ndarray] = None; cds: List[float] = []
     md = float(np.linalg.norm(rollout_start_position - gp))
     fd = md; ot = "timeout"; gh = 0
+    goal_schedule_index = -1
+    goal_switch_count = 0
+    minimum_clearance = body_clearance(
+        rollout_start_position, task, rollout_cfg.drone_radius)
     for step in range(mx):
+        if (
+            rollout_cfg.lstm_reset_interval > 0
+            and step > 0
+            and step % rollout_cfg.lstm_reset_interval == 0
+        ):
+            hidden = model.initial_hidden(1, device=device, dtype=dt)
+
         stt = dyn.get_state()
         pw = stt.position_world.copy()
         qq = stt.quaternion_world_body.copy()
@@ -720,10 +856,8 @@ def run_rollout(
                 if len(pt) >= dfl:
                     raw = pt[:dfl]
                     df = np.frombuffer(raw, dtype=np.float32).reshape((ih, iw))
-                    dm_ = np.flipud(df * 100.0)
-                    dm_ = np.nan_to_num(dm_, nan=rollout_cfg.depth_max_m,
-                                        posinf=rollout_cfg.depth_max_m, neginf=0.0)
-                    du = np.clip(dm_ / rollout_cfg.depth_max_m * 65535.0, 0, 65535).astype(np.uint16)
+                    du, depth_normalized = canonicalize_unity_depth(
+                        df, rollout_cfg.depth_max_m)
                     break
             vs = md_.get("pub_vehicles", [])
             if vs and vs[0].get("collision", False):
@@ -739,63 +873,52 @@ def run_rollout(
             ndt += 1; ot = "error"
             warnings.warn(f"[rollout] Ep {ep_idx} step {step}: depth timeout")
             break
-        gf, gdm, gdn = compute_global_guide(pw, gp, qq, mr)
+        sim_time_s = step * dts
+        active_goal, new_goal_index, goal_switch_event = active_goal_for_time(
+            task, sim_time_s, goal_schedule_index)
+        if goal_switch_event:
+            # Index zero establishes the initial local goal; later changes
+            # are actual planner updates. Hidden state intentionally persists.
+            if goal_schedule_index >= 0:
+                goal_switch_count += 1
+            goal_schedule_index = new_goal_index
+        gf, gdm, gdn = compute_global_guide(pw, active_goal, qq, mr)
         state_pw = pw.copy()
         state_yaw = _yaw_from_quat_xyzw(qq)
         state_velocity_flu = stt.velocity_flu.copy()
         state_speed = float(np.linalg.norm(stt.velocity_world))
-        depth_m = du.astype(np.float32) * (mr / 65535.0)
+        depth_m = du.astype(np.float32) * 0.01
         first_split = iw // 3
         second_split = 2 * iw // 3
         left_depth = depth_m[:, :first_split]
         center_depth = depth_m[:, first_split:second_split]
         right_depth = depth_m[:, second_split:]
-        dt_ = preprocess_depth(du, mh, mw, device)
-        rgt = torch.as_tensor(np.array(
-            [[float(gf[0]), float(gf[1]), float(gf[2]), float(gdn)]], dtype=np.float32,
-        ), device=device, dtype=dt)
+        dt_ = preprocess_depth(depth_normalized, device)
         grav_flu = il_common.world_vector_to_body_flu_quat(
             np.array([0.0, 0.0, -1.0], dtype=np.float64), qq,
         )
-        gft = torch.as_tensor(np.asarray([grav_flu], dtype=np.float32), device=device, dtype=dt)
-        vft = torch.as_tensor(np.asarray([stt.velocity_flu], dtype=np.float32).reshape(1, 3), device=device, dtype=dt)
-        yr = float(stt.angular_velocity_body[2])
-        yt = torch.as_tensor(np.array([[yr]], dtype=np.float32), device=device, dtype=dt)
+        omega_body = np.asarray(stt.angular_velocity_body, dtype=np.float32)
+        omega_flu = np.array(
+            [omega_body[1], -omega_body[0], omega_body[2]],
+            dtype=np.float32)
+        yr = float(omega_flu[2])
+        state_tensor = build_normalized_state(
+            grav_flu, stt.velocity_flu, yr, gf, float(gdn),
+            rollout_cfg.state_scale, device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         ti = time.perf_counter()
         with torch.no_grad():
-            out = model.forward_step(
-                depth=dt_, raw_guide=rgt, gravity_flu=gft,
-                velocity_flu=vft, yaw_rate=yt,
-                trend_state=ts, control_state=cs,
-            )
+            out = model.step(dt_, state_tensor, hidden)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         ims = (time.perf_counter() - ti) * 1000.0; mts.append(ims)
-        ts = model.detach_state(out.trend_state)
-        cs = model.detach_state(out.control_state)
-        cmf = out.command[0, 0].cpu().numpy().copy()
-        horizontal_prob = torch.softmax(
-            out.horizontal_logits[0, 0], dim=-1,
-        ).cpu().numpy()
-        vertical_prob = torch.softmax(
-            out.vertical_logits[0, 0], dim=-1,
-        ).cpu().numpy()
+        hidden = tuple(value.detach() for value in out.hidden)
+        cmf = out.command[0].cpu().numpy().copy()
+        normalized_command = out.normalized_command[0].cpu().numpy().copy()
         if pc is not None:
             cds.append(float(np.linalg.norm(cmf - pc)))
         pc = cmf.copy()
-        hi = int(out.horizontal_index[0, 0].item())
-        if hi == 0:
-            tl += 1
-            if not wr:
-                rec += 1; wr = True
-            cr += 1
-        elif hi == 12:
-            tr += 1
-            if not wr:
-                rec += 1; wr = True
-            cr += 1
-        else:
-            tn += 1
-            if wr:
-                mcr = max(mcr, cr); cr = 0; wr = False
         vc = cmf[:3].copy(); yc = float(cmf[3])
         dyn.step_velocity_command(vc, yc, dts)
         stt = dyn.get_state()
@@ -805,6 +928,8 @@ def run_rollout(
         fd = dst
         if dst < md:
             md = dst
+        clearance = body_clearance(pw, task, rollout_cfg.drone_radius)
+        minimum_clearance = min(minimum_clearance, clearance)
         spd = float(np.linalg.norm(stt.velocity_world))
         step_row: Dict[str, Any] = {
             "episode": ep_idx,
@@ -829,10 +954,18 @@ def run_rollout(
             "speed_world_mps": state_speed,
             "yaw_rate_rps": yr,
             "goal_distance_m": dst,
+            "active_goal_x": float(active_goal[0]),
+            "active_goal_y": float(active_goal[1]),
+            "active_goal_z": float(active_goal[2]),
+            "goal_switch_event": int(goal_switch_event and step > 0),
             "guide_x": float(gf[0]),
             "guide_y": float(gf[1]),
             "guide_z": float(gf[2]),
             "guide_distance_norm": float(gdn),
+            "state_gravity_x": float(grav_flu[0]),
+            "state_gravity_y": float(grav_flu[1]),
+            "state_gravity_z": float(grav_flu[2]),
+            "minimum_body_clearance_m": clearance,
             "depth_min_m": float(np.min(depth_m)),
             "depth_mean_m": float(np.mean(depth_m)),
             "depth_near_1m_frac": float(np.mean(depth_m < 1.0)),
@@ -842,45 +975,38 @@ def run_rollout(
             "depth_left_near_4m_frac": float(np.mean(left_depth < 4.0)),
             "depth_center_near_4m_frac": float(np.mean(center_depth < 4.0)),
             "depth_right_near_4m_frac": float(np.mean(right_depth < 4.0)),
-            "horizontal_index": hi,
-            "vertical_index": int(out.vertical_index[0, 0].item()),
-            "guide_value_raw": float(out.guide_value_raw[0, 0, 0].item()),
-            "guide_value": float(out.guide_value[0, 0, 0].item()),
+            "normalized_cmd_vx": float(normalized_command[0]),
+            "normalized_cmd_vy": float(normalized_command[1]),
+            "normalized_cmd_vz": float(normalized_command[2]),
+            "normalized_cmd_yaw_rate": float(normalized_command[3]),
             "cmd_vx_flu": float(vc[0]),
             "cmd_vy_flu": float(vc[1]),
             "cmd_vz_flu": float(vc[2]),
             "cmd_yaw_rate": yc,
             "inference_ms": ims,
         }
-        step_row.update({
-            f"horizontal_prob_{index}": float(probability)
-            for index, probability in enumerate(horizontal_prob)
-        })
-        step_row.update({
-            f"vertical_prob_{index}": float(probability)
-            for index, probability in enumerate(vertical_prob)
-        })
         data_logger.write_step(step_row)
-        if dst <= rollout_cfg.goal_tolerance_m and spd <= rollout_cfg.goal_speed_tolerance_mps:
+        schedule_complete = (
+            not task.goal_updates or
+            goal_schedule_index == len(task.goal_updates) - 1)
+        if schedule_complete and dst <= rollout_cfg.goal_tolerance_m and \
+                spd <= rollout_cfg.goal_speed_tolerance_mps:
             gh += 1
             if gh >= rollout_cfg.goal_hold_ticks:
                 ot = "success"; break
         else:
             gh = 0
         if rollout_cfg.verbose and step % 30 == 0:
-            hl = "REC_L" if hi == 0 else ("REC_R" if hi == 12 else "NORM")
             print(f"  [{ep_idx}:{step:04d}] dist={dst:.2f}m spd={spd:.2f}m/s | "
                   f"cmd=[{vc[0]:+.2f},{vc[1]:+.2f},{vc[2]:+.2f},{yc:+.2f}] | "
-                  f"trend={hl} | infer={ims:.1f}ms | guide={gdm:.1f}m", flush=True)
+                  f"infer={ims:.1f}ms | guide={gdm:.1f}m | "
+                  f"clear={clearance:.2f}m", flush=True)
         gid += 1
-    if wr:
-        mcr = max(mcr, cr)
     dur = (step + 1) * dts
     plen = float(sum(np.linalg.norm(pp[i]-pp[i-1]) for i in range(1, len(pp))))
     ai = float(np.mean(mts)) if mts else 0.0
     xi = float(np.max(mts)) if mts else 0.0
     ac = float(np.mean(cds)) if cds else 0.0
-    tot = tn + tl + tr or 1
     res = EpisodeResult(
         episode=ep_idx, task_name=task.name, scene_id=scene_id, mode="fixed",
         outcome=ot, duration_s=dur, path_length_m=plen,
@@ -888,9 +1014,8 @@ def run_rollout(
         num_model_steps=step+1, num_collision_frames=cf, first_collision_step=fcs,
         avg_inference_ms=ai, max_inference_ms=xi,
         num_depth_timeouts=ndt, num_frame_mismatches=nfm,
-        normal_fraction=tn/tot, recover_left_fraction=tl/tot,
-        recover_right_fraction=tr/tot,
-        recovery_entry_count=rec, max_consecutive_recovery=mcr,
+        goal_switch_count=goal_switch_count,
+        minimum_body_clearance_m=minimum_clearance,
         avg_command_delta=ac,
     )
     return res, gid + 1
@@ -899,12 +1024,14 @@ def run_rollout(
 def main() -> None:
     import os as _os  # noqa: F811  (used at function exit)
     p = argparse.ArgumentParser(
-        description="Deterministic task-suite rollout for HierarchicalTrendControlPolicy")
+        description="Closed-loop schema-v25 ViTFlyLSTMPolicy rollout")
     p.add_argument("--checkpoint")
-    p.add_argument("--model-file")
     p.add_argument(
-        "--tasks", default="all",
-        help="Comma-separated task names, or 'all' (default).")
+        "--model-file", default=str(_THIS_DIR / "model" / "model.py"),
+        help="Policy implementation (default: save_net/model/model.py).")
+    p.add_argument(
+        "--tasks", default="basic",
+        help="Comma-separated task names, or basic/stress/all (default: basic).")
     p.add_argument(
         "--list-tasks", action="store_true",
         help="List deterministic tasks and exit without loading the model.")
@@ -920,6 +1047,13 @@ def main() -> None:
     p.add_argument("--goal-hold-ticks", type=int, default=3)
     p.add_argument("--model-hz", type=float, default=30.0)
     p.add_argument("--ctrl-hz", type=float, default=50.0)
+    p.add_argument(
+        "--lstm-reset-interval", type=int, default=0,
+        help=(
+            "Reset the policy LSTM every N model steps (ablation only); "
+            "0 keeps state for the complete episode."
+        ),
+    )
     p.add_argument("--max-yaw-rate", type=float, default=2.0)
     p.add_argument("--depth-width", type=int, default=640)
     p.add_argument("--depth-height", type=int, default=480)
@@ -944,22 +1078,31 @@ def main() -> None:
     a = p.parse_args()
 
     task_registry = build_task_registry()
-    validate_task_registry(task_registry, drone_radius=0.30, safety_margin=0.10)
+    validate_task_registry(
+        task_registry, drone_radius=0.30, safety_margin=0.30,
+        minimum_surface_gap_m=1.20)
     if a.list_tasks:
         print("Deterministic rollout tasks:")
         for task in task_registry.values():
             print(
-                f"  {task.name:<16} obstacles={len(task.obstacles):>2}  "
+                f"  {task.name:<20} suite={task.suite:<6} "
+                f"obstacles={len(task.obstacles):>2}  "
                 f"{task.description}")
         return
-    if not a.checkpoint or not a.model_file:
-        p.error("--checkpoint and --model-file are required unless --list-tasks is used")
+    if not a.checkpoint:
+        p.error("--checkpoint is required unless --list-tasks is used")
     if a.repeats <= 0:
         p.error("--repeats must be > 0")
     if a.render_warmup_frames < 1:
         p.error("--render-warmup-frames must be >= 1")
-    if a.tasks.strip().lower() == "all":
+    if a.lstm_reset_interval < 0:
+        p.error("--lstm-reset-interval must be >= 0")
+    task_selector = a.tasks.strip().lower()
+    if task_selector == "all":
         selected_tasks = list(task_registry.values())
+    elif task_selector in ("basic", "stress"):
+        selected_tasks = [task for task in task_registry.values()
+                          if task.suite == task_selector]
     else:
         requested = [name.strip() for name in a.tasks.split(",") if name.strip()]
         unknown = [name for name in requested if name not in task_registry]
@@ -981,7 +1124,9 @@ def main() -> None:
         pub_port=a.pub_port, sub_port=a.sub_port, scene_id=a.scene_id,
         depth_width=a.depth_width, depth_height=a.depth_height,
         depth_fov=a.depth_fov, depth_max_m=a.depth_max_m,
-        model_hz=a.model_hz, ctrl_hz=a.ctrl_hz, max_yaw_rate=a.max_yaw_rate,
+        model_hz=a.model_hz, ctrl_hz=a.ctrl_hz,
+        lstm_reset_interval=a.lstm_reset_interval,
+        max_yaw_rate=a.max_yaw_rate,
         max_episode_time=a.max_episode_time,
         goal_tolerance_m=a.goal_tolerance,
         goal_speed_tolerance_mps=a.goal_speed_tolerance,
@@ -996,36 +1141,22 @@ def main() -> None:
         dev = torch.device(a.device)
         if a.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("--device cuda but CUDA unavailable")
-    MC, CC = _load_model_from_file(cf.model_file)
-    try:
-        ckpt = torch.load(cf.checkpoint, map_location=dev, weights_only=False)
-    except TypeError:
-        ckpt = torch.load(cf.checkpoint, map_location=dev)
-    cd = ckpt.get("model_config") or ckpt.get("config") or {}
-    mc = CC(**cd) if cd else CC()
-    mc.validate()
-    model = MC(mc)
-    sd = ckpt["model_state_dict"]
-    model.load_state_dict({
-        k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v
-        for k, v in sd.items()
-    }, strict=True)
-    model.to(device=dev); model.eval()
+    model, mc, checkpoint_scale = load_policy_checkpoint(
+        cf.checkpoint, cf.model_file, dev, cf.depth_max_m)
+    cf.state_scale = checkpoint_scale
     # CUDA warmup: first inference is slow (kernel compilation).
     with torch.no_grad():
-        _ = model.forward_step(
-            depth=torch.zeros(1, 1, mc.image_size[0], mc.image_size[1], device=dev, dtype=torch.float32),
-            raw_guide=torch.zeros(1, 4, device=dev, dtype=torch.float32),
-            gravity_flu=torch.zeros(1, 3, device=dev, dtype=torch.float32),
-            velocity_flu=torch.zeros(1, 3, device=dev, dtype=torch.float32),
-            yaw_rate=torch.zeros(1, 1, device=dev, dtype=torch.float32),
-        )
+        _ = model.step(
+            torch.ones(1, 1, mc.image_height, mc.image_width,
+                       device=dev, dtype=torch.float32),
+            torch.zeros(1, 11, device=dev, dtype=torch.float32),
+            model.initial_hidden(1, device=dev, dtype=torch.float32))
     if dev.type == "cuda":
         torch.cuda.synchronize()
     print("[rollout] CUDA warmup complete.")
     total_episodes = len(selected_tasks) * cf.repeats
     print("="*60)
-    print("Policy Rollout - HierarchicalTrendControlPolicy")
+    print("Policy Rollout - ViTFlyLSTMPolicy (schema v25)")
     print("="*60)
     print(f"  Checkpoint:  {cf.checkpoint}")
     print(f"  Model file:  {cf.model_file}")
@@ -1036,12 +1167,19 @@ def main() -> None:
     print(f"  Episodes:    {total_episodes}")
     print(f"  Model Hz:    {cf.model_hz}  (collector record rate)")
     print(f"  Ctrl Hz:     {cf.ctrl_hz}   (collector control rate)")
+    if cf.lstm_reset_interval > 0:
+        print(
+            f"  LSTM state:  reset every {cf.lstm_reset_interval} model steps"
+        )
+    else:
+        print("  LSTM state:  continuous for complete episode")
     print(f"  Depth:       {cf.depth_width}x{cf.depth_height} max={cf.depth_max_m}m")
     print(f"  Render warm: {cf.render_warmup_frames} discarded frames/episode")
     print(f"  Goal:        {cf.goal_tolerance_m}m <={cf.goal_speed_tolerance_mps}m/s x{cf.goal_hold_ticks}")
     print(f"  Ports:       PUB={cf.pub_port} SUB={cf.sub_port}")
     print(f"  Params:      {sum(p.numel() for p in model.parameters()):,}")
-    print(f"  Model image: {mc.image_size}")
+    print(f"  Model image: {(mc.image_height, mc.image_width)}")
+    print(f"  State:       11-D schema-v25, scale={cf.state_scale}")
     log_metadata = {
         "format_version": 1,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1117,8 +1255,8 @@ def main() -> None:
                 num_collision_frames=0, first_collision_step=-1,
                 avg_inference_ms=0, max_inference_ms=0,
                 num_depth_timeouts=0, num_frame_mismatches=0,
-                normal_fraction=0, recover_left_fraction=0, recover_right_fraction=0,
-                recovery_entry_count=0, max_consecutive_recovery=0,
+                goal_switch_count=0,
+                minimum_body_clearance_m=float("inf"),
                 avg_command_delta=0,
             )
             gid += 10
@@ -1134,8 +1272,8 @@ def main() -> None:
               f"steps={result.num_model_steps} | "
               f"infer={result.avg_inference_ms:.1f}/{result.max_inference_ms:.1f}ms | "
               f"cmdD={result.avg_command_delta:.3f} | "
-              f"rec_entries={result.recovery_entry_count} "
-              f"max_cons={result.max_consecutive_recovery} | "
+              f"switches={result.goal_switch_count} "
+              f"min_clear={result.minimum_body_clearance_m:.2f}m | "
               f"dto={result.num_depth_timeouts} fmm={result.num_frame_mismatches}"
               + cm, flush=True)
     # Safe cleanup: avoid segfault from ZMQ / C++ dynamics teardown.
@@ -1173,11 +1311,12 @@ def main() -> None:
         print(f"  Avg final dist: {np.mean([r.final_goal_distance_m for r in fin]):.2f}m")
         print(f"  Avg infer:      {np.mean([r.avg_inference_ms for r in fin]):.1f}ms")
         print(f"  Avg cmd delta:  {np.mean([r.avg_command_delta for r in fin]):.4f}")
-    an = np.mean([r.normal_fraction for r in results]) if results else 0
-    al = np.mean([r.recover_left_fraction for r in results]) if results else 0
-    ar = np.mean([r.recover_right_fraction for r in results]) if results else 0
-    ae = np.mean([r.recovery_entry_count for r in results]) if results else 0
-    print(f"\n  Trend:   normal={an:.1%} rec_left={al:.1%} rec_right={ar:.1%} entries={ae:.1f}")
+    switches = sum(r.goal_switch_count for r in results)
+    finite_clearances = [r.minimum_body_clearance_m for r in results
+                         if math.isfinite(r.minimum_body_clearance_m)]
+    if finite_clearances:
+        print(f"\n  Safety:  minimum body clearance={min(finite_clearances):.2f}m")
+    print(f"  Goals:   applied in-episode updates={switches}")
     tto = sum(r.num_depth_timeouts for r in results)
     tmm = sum(r.num_frame_mismatches for r in results)
     print(f"  Infra:   depth_timeouts={tto}  frame_mismatches={tmm}")
