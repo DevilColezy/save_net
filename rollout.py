@@ -227,6 +227,9 @@ class RolloutTask:
     # t=0.  ``goal`` remains the final endpoint used for success evaluation.
     goal_updates: Tuple[Tuple[float, Tuple[float, float, float]], ...] = ()
     suite: str = "basic"
+    # Scene number in an external manifest.  This is intentionally separate
+    # from the Unity scene selected by the rollout CLI.
+    scene_id: Optional[int] = None
 
 
 # il_dataset_config.yaml: scene_generation.obstacle_region and the primary

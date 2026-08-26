@@ -40,6 +40,7 @@ Examples:
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import random
@@ -140,7 +141,7 @@ SCHEMA25_ROLLOUT_COLUMNS = [
     "episode_frame_index", "trajectory_time_s", "control_dt_s",
     "x", "y", "z", "yaw", "yaw_rate",
     "state_vx_flu", "state_vy_flu", "state_vz_flu",
-    "speed_world_mps",
+    "speed_world_mps", "inference_ms",
     "effective_target_world_x", "effective_target_world_y",
     "effective_target_world_z",
     "goal_direction_flu_x", "goal_direction_flu_y",
@@ -217,7 +218,7 @@ class SchemaV25EpisodeWriter:
                               [float(v) for v in min_bounds],
                               [float(v) for v in max_bounds])
 
-    def write_row(self, step, dts, pw, qq, stt, yaw, yr, spd,
+    def write_row(self, step, dts, pw, qq, stt, yaw, yr, spd, inference_ms,
                   eout, vc, yc, gdn, nav_dir, obs_clearance,
                   truth_cfg, task_goal):
         """Write one schema-v25 row for the current tick.
@@ -235,6 +236,7 @@ class SchemaV25EpisodeWriter:
             "state_vy_flu": float(stt.velocity_flu[1]),
             "state_vz_flu": float(stt.velocity_flu[2]),
             "speed_world_mps": float(spd),
+            "inference_ms": float(inference_ms),
             "effective_target_world_x": float(eout.effective_target_world_x),
             "effective_target_world_y": float(eout.effective_target_world_y),
             "effective_target_world_z": float(eout.effective_target_world_z),
@@ -349,18 +351,27 @@ def _encode_plan_points(px, py):
 #  Every task's straight start->goal line provably crosses an obstacle CORE
 #  (or threads the S_gap narrow passage), so a successful flight MUST detour.
 #  The scene/task data and the deterministic initial-yaw sampling are reused
-#  verbatim from ../il_dataset/gen_avoid_scenes.py (single source of truth),
-#  so the rollout exercises exactly the handcrafted collection layout.
+#  verbatim from il_dataset/gen_avoid_scenes.py (single source of truth).
+#  The generator is currently kept under il_dataset/test, but the legacy
+#  package-root location remains supported for older workspaces, so the
+#  rollout exercises exactly the handcrafted collection layout.
 # ============================================================================
 
 _IL_DATASET_DIR = _THIS_DIR.parent / "il_dataset"
-if str(_IL_DATASET_DIR) not in sys.path:
-    sys.path.insert(0, str(_IL_DATASET_DIR))
+_AVOID_SCENE_PATHS = (
+    _IL_DATASET_DIR / "gen_avoid_scenes.py",
+    _IL_DATASET_DIR / "test" / "gen_avoid_scenes.py",
+)
+_AVOID_SCENE_PATH = next(
+    (path for path in _AVOID_SCENE_PATHS if path.is_file()), None)
 
-try:
-    import gen_avoid_scenes as _avoid
-except ImportError:  # pragma: no cover
-    _avoid = None
+_avoid = None
+if _AVOID_SCENE_PATH is not None:
+    _avoid_spec = importlib.util.spec_from_file_location(
+        "_il_dataset_gen_avoid_scenes", str(_AVOID_SCENE_PATH))
+    if _avoid_spec is not None and _avoid_spec.loader is not None:
+        _avoid = importlib.util.module_from_spec(_avoid_spec)
+        _avoid_spec.loader.exec_module(_avoid)
 
 
 def _avoid_initial_yaw(task, scene_index, rng):
@@ -384,7 +395,8 @@ def build_avoid_task_registry() -> Dict[str, RolloutTask]:
     """
     if _avoid is None:  # pragma: no cover
         raise RuntimeError(
-            "Cannot import gen_avoid_scenes.py from {}".format(_IL_DATASET_DIR))
+            "Cannot import gen_avoid_scenes.py from {}".format(
+                ", ".join(str(path) for path in _AVOID_SCENE_PATHS)))
     tasks: Dict[str, RolloutTask] = {}
     for scene_index, sc in enumerate(_avoid.SCENES):
         rng = random.Random(20260824 + scene_index * 7919)
@@ -406,6 +418,7 @@ def build_avoid_task_registry() -> Dict[str, RolloutTask]:
                 start_yaw=start_yaw,
                 obstacles=obstacles,
                 suite="avoid",
+                scene_id=scene_index,
             )
     return tasks
 
@@ -882,7 +895,8 @@ def run_hierarchical_rollout(
         if schema_writer is not None:
             schema_writer.write_row(
                 step=step, dts=dts, pw=pw, qq=qq, stt=stt, yaw=yaw, yr=yr,
-                spd=spd, eout=eout, vc=vc, yc=yc, gdn=gdn, nav_dir=None,
+                spd=spd, inference_ms=ims, eout=eout, vc=vc, yc=yc,
+                gdn=gdn, nav_dir=None,
                 obs_clearance=clearance, truth_cfg=truth_cfg,
                 task_goal=gp)
 
@@ -1151,7 +1165,13 @@ def main() -> None:
             ep_dir = Path(hr_cfg.episode_out_root) / (
                 "ep%04d_%s" % (ep, task.name))
             schema_writer = SchemaV25EpisodeWriter(
-                str(ep_dir), scene_id=a.scene_id, task_id=ep,
+                str(ep_dir),
+                # The row scene_id is used by interactive_trajectory_debug
+                # to index the handcrafted manifest.  It must be the avoid
+                # scene id, not the Unity scene selected with --scene-id.
+                scene_id=(task.scene_id if task.scene_id is not None
+                          else a.scene_id),
+                task_id=ep,
                 navigation_goal_world=[float(gp[0]), float(gp[1]),
                                        float(gp[2])],
                 initial_yaw=float(task.start_yaw))
