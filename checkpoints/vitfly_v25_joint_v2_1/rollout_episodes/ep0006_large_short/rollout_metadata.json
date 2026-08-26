@@ -1,0 +1,14 @@
+{
+ "episode_valid": 0,
+ "failure_taxonomy": "",
+ "outcome": "timeout",
+ "rows": 900,
+ "scene_id": 1,
+ "task_id": 6,
+ "navigation_goal_world": [
+  0.0,
+  16.0,
+  2.0
+ ],
+ "initial_yaw": 0.2229116994205036
+}

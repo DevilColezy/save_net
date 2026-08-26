@@ -1,0 +1,826 @@
+{
+  "format_version": 1,
+  "started_at_utc": "2026-08-26T03:22:10.097055+00:00",
+  "rollout_config": {
+    "checkpoint": "checkpoints/vitfly_v25_joint_v2_1/last.pt",
+    "model_file": "/home/rgzn/flightmare_ws/src/save_net/model/model.py",
+    "expert_config": "../il_dataset/config/il_dataset_joint_v2_config.yaml",
+    "pub_port": "10253",
+    "sub_port": "10254",
+    "scene_id": 1,
+    "depth_width": 640,
+    "depth_height": 480,
+    "depth_fov": 90.0,
+    "depth_near": 0.01,
+    "depth_far": 1000.0,
+    "depth_max_m": 5.0,
+    "depth_t_bc": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.3,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "model_hz": 30.0,
+    "ctrl_hz": 50.0,
+    "lstm_reset_interval": 0,
+    "max_yaw_rate": 2.0,
+    "max_episode_time": 30.0,
+    "goal_tolerance_m": 0.3,
+    "goal_speed_tolerance_mps": 0.2,
+    "goal_hold_ticks": 3,
+    "collision_confirm_frames": 1,
+    "drone_radius": 0.3,
+    "safety_margin": 0.3,
+    "minimum_surface_gap_m": 1.2,
+    "state_scale": [
+      1.0,
+      1.0,
+      1.0,
+      2.5,
+      2.5,
+      2.5,
+      1.5,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "device": "auto",
+    "repeats": 1,
+    "verbose": true,
+    "log_prefix": "rollout_hi_latest",
+    "render_warmup_frames": 5,
+    "flight_z": 2.0,
+    "frame_match_timeout_s": 0.15,
+    "max_frame_retries": 5,
+    "episode_out_root": "/home/rgzn/flightmare_ws/src/save_net/checkpoints/vitfly_v25_joint_v2_1/rollout_episodes"
+  },
+  "model_config": {
+    "image_height": 60,
+    "image_width": 90,
+    "state_dim": 11,
+    "stage_dims": [
+      32,
+      64
+    ],
+    "stage_depths": [
+      2,
+      2
+    ],
+    "stage_heads": [
+      1,
+      2
+    ],
+    "sr_ratios": [
+      8,
+      4
+    ],
+    "visual_dim": 256,
+    "state_hidden_dim": 96,
+    "lstm_hidden_dim": 192,
+    "lstm_layers": 3,
+    "dropout": 0.1,
+    "command_scale": [
+      2.5,
+      2.5,
+      2.5,
+      1.5
+    ]
+  },
+  "tasks": [
+    {
+      "name": "small_short",
+      "description": "S_small: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        7.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        13.0,
+        2.0
+      ],
+      "start_yaw": -0.8435893594283952,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 10.0,
+          "radius": 0.4,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "small_medium",
+      "description": "S_small: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        4.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        16.0,
+        2.0
+      ],
+      "start_yaw": -0.9006756697759339,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 10.0,
+          "radius": 0.4,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "small_long",
+      "description": "S_small: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        1.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        19.0,
+        2.0
+      ],
+      "start_yaw": -1.2237259169378918,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 10.0,
+          "radius": 0.4,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "medium_short",
+      "description": "S_medium: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        9.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        15.0,
+        2.0
+      ],
+      "start_yaw": 0.7718112357320539,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 12.0,
+          "radius": 1.0,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "medium_medium",
+      "description": "S_medium: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        6.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        18.0,
+        2.0
+      ],
+      "start_yaw": -0.9312622244830928,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 12.0,
+          "radius": 1.0,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "medium_long",
+      "description": "S_medium: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        3.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        21.0,
+        2.0
+      ],
+      "start_yaw": 1.3035221893449584,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 12.0,
+          "radius": 1.0,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "large_short",
+      "description": "S_large: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        8.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        16.0,
+        2.0
+      ],
+      "start_yaw": 0.2229116994205036,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 13.0,
+          "radius": 2.5,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "large_medium",
+      "description": "S_large: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        7.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        19.0,
+        2.0
+      ],
+      "start_yaw": -3.5779515184829442,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 13.0,
+          "radius": 2.5,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "large_long",
+      "description": "S_large: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        4.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        22.0,
+        2.0
+      ],
+      "start_yaw": -4.658409695523507,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 13.0,
+          "radius": 2.5,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "chain2_long_a",
+      "description": "S_chain2: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        -6.0,
+        3.0,
+        2.0
+      ],
+      "goal": [
+        6.0,
+        23.0,
+        2.0
+      ],
+      "start_yaw": -1.3258172448484382,
+      "obstacles": [
+        {
+          "x": -2.4,
+          "y": 9.0,
+          "radius": 0.5,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 2.4,
+          "y": 17.0,
+          "radius": 0.7,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "chain2_long_b",
+      "description": "S_chain2: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        -5.0,
+        5.0,
+        2.0
+      ],
+      "goal": [
+        5.0,
+        21.0,
+        2.0
+      ],
+      "start_yaw": 0.37188076545391,
+      "obstacles": [
+        {
+          "x": -2.4,
+          "y": 9.0,
+          "radius": 0.5,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 2.4,
+          "y": 17.0,
+          "radius": 0.7,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "chain3_long",
+      "description": "S_chain3: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        -6.0,
+        3.0,
+        2.0
+      ],
+      "goal": [
+        6.0,
+        25.0,
+        2.0
+      ],
+      "start_yaw": -1.2305293434272198,
+      "obstacles": [
+        {
+          "x": -3.0,
+          "y": 8.5,
+          "radius": 0.5,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 0.6,
+          "y": 15.1,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 4.2,
+          "y": 21.7,
+          "radius": 0.5,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "bigsmall_long",
+      "description": "S_bigsmall: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        -6.0,
+        3.0,
+        2.0
+      ],
+      "goal": [
+        6.0,
+        25.0,
+        2.0
+      ],
+      "start_yaw": 0.4087487886955703,
+      "obstacles": [
+        {
+          "x": -3.0,
+          "y": 8.5,
+          "radius": 2.2,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 0.6,
+          "y": 15.1,
+          "radius": 0.5,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 4.2,
+          "y": 21.7,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "xlarge_short",
+      "description": "S_xlarge: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        10.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        20.0,
+        2.0
+      ],
+      "start_yaw": -1.05093466755822,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 15.0,
+          "radius": 3.0,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "xlarge_medium",
+      "description": "S_xlarge: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        8.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        22.0,
+        2.0
+      ],
+      "start_yaw": 0.16451305616882728,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 15.0,
+          "radius": 3.0,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "xlarge_long",
+      "description": "S_xlarge: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        6.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        24.0,
+        2.0
+      ],
+      "start_yaw": -3.514289767778303,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 15.0,
+          "radius": 3.0,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "xlarge2_short",
+      "description": "S_xlarge2: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        10.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        20.0,
+        2.0
+      ],
+      "start_yaw": 0.017630507261439554,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 15.0,
+          "radius": 3.5,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "xlarge2_medium",
+      "description": "S_xlarge2: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        7.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        23.0,
+        2.0
+      ],
+      "start_yaw": -0.8598173679720915,
+      "obstacles": [
+        {
+          "x": 0.0,
+          "y": 15.0,
+          "radius": 3.5,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "gap_short",
+      "description": "S_gap: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        8.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        16.0,
+        2.0
+      ],
+      "start_yaw": -4.123340050726529,
+      "obstacles": [
+        {
+          "x": -1.4,
+          "y": 12.0,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 1.4,
+          "y": 12.0,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "gap_medium",
+      "description": "S_gap: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        0.0,
+        6.0,
+        2.0
+      ],
+      "goal": [
+        0.0,
+        18.0,
+        2.0
+      ],
+      "start_yaw": -2.6813509905124744,
+      "obstacles": [
+        {
+          "x": -1.4,
+          "y": 12.0,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 1.4,
+          "y": 12.0,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    },
+    {
+      "name": "gap_diagonal",
+      "description": "S_gap: start->goal line crosses obstacle core -> must detour",
+      "start": [
+        -2.0,
+        7.0,
+        2.0
+      ],
+      "goal": [
+        2.0,
+        17.0,
+        2.0
+      ],
+      "start_yaw": 0.4280955522148897,
+      "obstacles": [
+        {
+          "x": -1.4,
+          "y": 12.0,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        },
+        {
+          "x": 1.4,
+          "y": 12.0,
+          "radius": 0.6,
+          "height": 8.0,
+          "base_z": 0.0
+        }
+      ],
+      "max_episode_time": null,
+      "goal_updates": [],
+      "suite": "avoid"
+    }
+  ],
+  "expert_revision": "r20260823_pool_first_exploration_r30",
+  "expert_config": "../il_dataset/config/il_dataset_joint_v2_config.yaml",
+  "status": "running",
+  "updated_at_utc": "2026-08-26T03:25:21.192128+00:00",
+  "completed_episodes": 4,
+  "results": [
+    {
+      "episode": 0,
+      "task_name": "small_short",
+      "scene_id": 1,
+      "mode": "hier",
+      "outcome": "timeout",
+      "duration_s": 30.0,
+      "path_length_m": 12.693861821139198,
+      "final_goal_distance_m": 1.1399715771985424,
+      "min_goal_distance_m": 0.31236762325830325,
+      "num_model_steps": 900,
+      "num_collision_frames": 0,
+      "first_collision_step": -1,
+      "avg_inference_ms": 2.375808326622872,
+      "max_inference_ms": 4.293111000151839,
+      "num_depth_timeouts": 0,
+      "num_frame_mismatches": 0,
+      "goal_switch_count": 0,
+      "minimum_body_clearance_m": 0.5876947374860664,
+      "avg_command_delta": 0.018990677211456676
+    },
+    {
+      "episode": 1,
+      "task_name": "small_medium",
+      "scene_id": 1,
+      "mode": "hier",
+      "outcome": "timeout",
+      "duration_s": 30.0,
+      "path_length_m": 41.303842791306685,
+      "final_goal_distance_m": 3.8766873740792955,
+      "min_goal_distance_m": 0.9338980024714982,
+      "num_model_steps": 900,
+      "num_collision_frames": 0,
+      "first_collision_step": -1,
+      "avg_inference_ms": 2.3626072055857446,
+      "max_inference_ms": 4.565080998872872,
+      "num_depth_timeouts": 0,
+      "num_frame_mismatches": 1,
+      "goal_switch_count": 0,
+      "minimum_body_clearance_m": 2.4162079324820316,
+      "avg_command_delta": 0.017090057911038205
+    },
+    {
+      "episode": 2,
+      "task_name": "small_long",
+      "scene_id": 1,
+      "mode": "hier",
+      "outcome": "timeout",
+      "duration_s": 30.0,
+      "path_length_m": 24.748916148961214,
+      "final_goal_distance_m": 1.1382229986618844,
+      "min_goal_distance_m": 0.6744283780772113,
+      "num_model_steps": 900,
+      "num_collision_frames": 0,
+      "first_collision_step": -1,
+      "avg_inference_ms": 3.6527964901243752,
+      "max_inference_ms": 7.405552001728211,
+      "num_depth_timeouts": 0,
+      "num_frame_mismatches": 1,
+      "goal_switch_count": 0,
+      "minimum_body_clearance_m": 3.0146987150359172,
+      "avg_command_delta": 0.012966271642532336
+    },
+    {
+      "episode": 3,
+      "task_name": "medium_short",
+      "scene_id": 1,
+      "mode": "hier",
+      "outcome": "timeout",
+      "duration_s": 30.0,
+      "path_length_m": 1.6020126294137806,
+      "final_goal_distance_m": 4.903750619441118,
+      "min_goal_distance_m": 4.837348428288505,
+      "num_model_steps": 900,
+      "num_collision_frames": 0,
+      "first_collision_step": -1,
+      "avg_inference_ms": 3.6902926234163007,
+      "max_inference_ms": 5.85308599693235,
+      "num_depth_timeouts": 0,
+      "num_frame_mismatches": 1,
+      "goal_switch_count": 0,
+      "minimum_body_clearance_m": 0.5867323090170122,
+      "avg_command_delta": 0.0034838129445183205
+    }
+  ],
+  "steps_file": "/home/rgzn/flightmare_ws/src/save_net/rollout_hi_latest_steps.csv"
+}
