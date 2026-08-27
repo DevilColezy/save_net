@@ -541,7 +541,11 @@ class V25SequenceDataset(Dataset):
             should_flip = random.random() < 0.5
         if self.augment and should_flip:
             depth = depth[:, :, :, ::-1].copy()
-            state[:, [1, 4, 6, 8]] *= -1.0
+            # 7-D STATE_FIELDS = (gravity_x, gravity_y, gravity_z,
+            # goal_dir_x, goal_dir_y, goal_dir_z, goal_dist_norm): only the
+            # LEFT-axis components (gravity_y index 1, goal_dir_y index 4)
+            # mirror; x/z are never negated.
+            state[:, [1, 4]] *= -1.0
             target[:, [1, 3]] *= -1.0
             # ── 5 Hz mirror (item 二) ────────────────────────────────
             # STATE_FIELDS_5HZ = (nav_goal_dir_x, nav_goal_dir_y,
