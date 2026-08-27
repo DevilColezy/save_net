@@ -28,8 +28,6 @@ SCHEMA_VERSION = 25
 # effective target of the 5 Hz corrector + 30 Hz planner).
 STATE_FIELDS = (
     "gravity_flu_x", "gravity_flu_y", "gravity_flu_z",
-    "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
-    "yaw_rate_flu",
     "goal_direction_flu_x", "goal_direction_flu_y", "goal_direction_flu_z",
     "goal_distance_norm",
 )
@@ -58,8 +56,9 @@ REQUIRED_FIELDS = set(("episode_frame_index", "frame_valid", "depth_file",
                       LABEL_FIELDS_5HZ)
 STATE_SCALE = np.asarray(
     # gravity_flu is the unit gravity direction written by il_manager,
-    # not acceleration in m/s^2.
-    [1.0, 1.0, 1.0, 2.5, 2.5, 2.5, 1.5, 1.0, 1.0, 1.0, 1.0],
+    # not acceleration in m/s^2.  7-D: velocity/yaw_rate inputs removed so
+    # the policy cannot short-circuit on current motion (must read depth).
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
     dtype=np.float32)
 # The 5 Hz upper-planner state is self state plus the ORIGINAL navigation
 # goal.  It must not use goal_direction_flu_* (the effective 30 Hz target),

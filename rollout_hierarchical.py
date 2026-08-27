@@ -13,7 +13,7 @@ exactly as the schema-v25 collector does:
     stateful (FSM / history map / corridor diagnostics) and consumes the same
     metre-valued depth frames the collector feeds it.
   * LOWER (30 Hz): the trained schema-v25 ``ViTFlyLSTMPolicy`` student.  It
-    receives the depth frame plus the 11-D state whose goal part is the
+    receives the depth frame plus the 7-D state whose goal part is the
     expert's *effective* target (``goal_direction_flu_*`` /
     ``goal_distance_norm`` from ``ExpertStepOutput``) and regresses the
     body-FLU velocity + yaw-rate command that the dynamics executes.
@@ -355,6 +355,10 @@ def _encode_plan_points(px, py):
 #  The generator is currently kept under il_dataset/test, but the legacy
 #  package-root location remains supported for older workspaces, so the
 #  rollout exercises exactly the handcrafted collection layout.
+#
+#  A second generator, gen_avoid_scenes_4level.py, mirrors the scene_parallel
+#  COLLECTION recipe (small / medium / large / mixed — 2 scenes x 2 tasks per
+#  level = 8 scenes / 16 tasks) and is exposed via ``--tasks 4level``.
 # ============================================================================
 
 _IL_DATASET_DIR = _THIS_DIR.parent / "il_dataset"
@@ -362,50 +366,59 @@ _AVOID_SCENE_PATHS = (
     _IL_DATASET_DIR / "gen_avoid_scenes.py",
     _IL_DATASET_DIR / "test" / "gen_avoid_scenes.py",
 )
-_AVOID_SCENE_PATH = next(
-    (path for path in _AVOID_SCENE_PATHS if path.is_file()), None)
-
-_avoid = None
-if _AVOID_SCENE_PATH is not None:
-    _avoid_spec = importlib.util.spec_from_file_location(
-        "_il_dataset_gen_avoid_scenes", str(_AVOID_SCENE_PATH))
-    if _avoid_spec is not None and _avoid_spec.loader is not None:
-        _avoid = importlib.util.module_from_spec(_avoid_spec)
-        _avoid_spec.loader.exec_module(_avoid)
+_FOURLEVEL_SCENE_PATHS = (
+    _IL_DATASET_DIR / "gen_avoid_scenes_4level.py",
+    _IL_DATASET_DIR / "test" / "gen_avoid_scenes_4level.py",
+)
 
 
-def _avoid_initial_yaw(task, scene_index, rng):
-    """Deterministic per-scene initial yaw identical to gen_avoid_scenes.
+def _load_scene_module(module_name, paths):
+    """Import a handcrafted scene generator by path (single source)."""
+    scene_path = next((path for path in paths if path.is_file()), None)
+    if scene_path is None:
+        return None
+    spec = importlib.util.spec_from_file_location(module_name, str(scene_path))
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_avoid = _load_scene_module(
+    "_il_dataset_gen_avoid_scenes", _AVOID_SCENE_PATHS)
+_4level = _load_scene_module(
+    "_il_dataset_gen_avoid_scenes_4level", _FOURLEVEL_SCENE_PATHS)
+
+
+def _scene_initial_yaw(module, task, scene_index, rng):
+    """Deterministic per-scene initial yaw identical to the generator.
 
     ``sample_initial_yaw`` returns FM convention B (expert_yaw - pi/2), the
     same convention rollout.py uses for ``forward_yaw``.
     """
     sx, sy, gx, gy, _label = task
     goal_bearing_expert = math.atan2(gy - sy, gx - sx)
-    return _avoid.sample_initial_yaw(goal_bearing_expert, rng)
+    return module.sample_initial_yaw(goal_bearing_expert, rng)
 
 
-def build_avoid_task_registry() -> Dict[str, RolloutTask]:
-    """Build the handcrafted avoidance tasks (gen_avoid_scenes layout).
-
-    Each scene contributes one ``RolloutTask`` per start/goal pair; every
-    task carries the scene's full obstacle set.  The initial yaw uses the
-    same deterministic per-scene RNG seed as the collector blueprint so the
-    rollout replicates the collection initial conditions.
-    """
-    if _avoid is None:  # pragma: no cover
+def _build_scene_task_registry(module, suite: str) -> Dict[str, RolloutTask]:
+    """Build one ``RolloutTask`` per start/goal pair from a handcrafted
+    scene generator module (``.SCENES`` list of dicts).  The initial yaw uses
+    the same deterministic per-scene RNG seed as the collector blueprint so
+    the rollout replicates the collection initial conditions."""
+    if module is None:  # pragma: no cover
         raise RuntimeError(
-            "Cannot import gen_avoid_scenes.py from {}".format(
-                ", ".join(str(path) for path in _AVOID_SCENE_PATHS)))
+            "Cannot import scene generator module for suite '%s'" % suite)
     tasks: Dict[str, RolloutTask] = {}
-    for scene_index, sc in enumerate(_avoid.SCENES):
+    for scene_index, sc in enumerate(module.SCENES):
         rng = random.Random(20260824 + scene_index * 7919)
         obstacles = tuple(
             Cylinder(float(o[0]), float(o[1]), float(o[2]))
             for o in sc["obstacles"])
         for task in sc["tasks"]:
             sx, sy, gx, gy, label = task
-            start_yaw = _avoid_initial_yaw(task, scene_index, rng)
+            start_yaw = _scene_initial_yaw(module, task, scene_index, rng)
             name = "{}".format(label)
             description = (
                 "{}: start->goal line crosses obstacle core -> must detour"
@@ -417,10 +430,27 @@ def build_avoid_task_registry() -> Dict[str, RolloutTask]:
                 goal=(float(gx), float(gy), 2.0),
                 start_yaw=start_yaw,
                 obstacles=obstacles,
-                suite="avoid",
+                suite=suite,
                 scene_id=scene_index,
             )
     return tasks
+
+
+def build_avoid_task_registry() -> Dict[str, RolloutTask]:
+    """Handcrafted avoidance tasks (gen_avoid_scenes layout)."""
+    return _build_scene_task_registry(_avoid, "avoid")
+
+
+def build_4level_task_registry() -> Dict[str, RolloutTask]:
+    """4-level scene_parallel-mirror tasks (gen_avoid_scenes_4level layout):
+    small / medium / large / mixed, 2 scenes x 2 tasks per level."""
+    return _build_scene_task_registry(_4level, "4level")
+
+
+_TASK_REGISTRY_BUILDERS = {
+    "avoid": build_avoid_task_registry,
+    "4level": build_4level_task_registry,
+}
 
 
 @dataclass
@@ -805,7 +835,7 @@ def run_hierarchical_rollout(
             [omega_body[1], -omega_body[0], omega_body[2]], dtype=np.float32)
         yr = float(omega_flu[2])
         state_tensor = build_normalized_state(
-            grav_flu, stt.velocity_flu, yr, gf, gdn,
+            grav_flu, gf, gdn,
             hr_cfg.state_scale, device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -953,7 +983,9 @@ def main() -> None:
              "../il_dataset/config/il_dataset_joint_v2_config.yaml).")
     p.add_argument(
         "--tasks", default="avoid",
-        help="Comma-separated task names, or avoid/all (default: avoid).")
+        help="Comma-separated task names, or a suite selector: "
+             "avoid (gen_avoid_scenes), 4level (gen_avoid_scenes_4level), "
+             "all (default: avoid).")
     p.add_argument(
         "--list-tasks", action="store_true",
         help="List avoidance tasks and exit without loading the model.")
@@ -997,7 +1029,17 @@ def main() -> None:
         help="Output prefix for CSV/JSON diagnostics (default: ./rollout_hi_latest).")
     a = p.parse_args()
 
-    task_registry = build_avoid_task_registry()
+    task_selector = a.tasks.strip().lower()
+    # Suite selectors (avoid / 4level) pick a single scene generator; the
+    # named-task and all selectors merge every registry.
+    if task_selector in _TASK_REGISTRY_BUILDERS:
+        task_registry = _TASK_REGISTRY_BUILDERS[task_selector]()
+        registry_label = task_selector
+    else:
+        task_registry = {}
+        for builder in _TASK_REGISTRY_BUILDERS.values():
+            task_registry.update(builder())
+        registry_label = "all" if task_selector == "all" else "named"
     # The handcrafted avoidance layout intentionally places goals close to
     # obstacle edges (surface gap ~0.5 m on large_short) to force a precise
     # detour; the strict single-policy 0.6 m clearance pad is inappropriate
@@ -1006,7 +1048,7 @@ def main() -> None:
         task_registry, drone_radius=0.30, safety_margin=0.0,
         minimum_surface_gap_m=1.20)
     if a.list_tasks:
-        print("Handcrafted avoidance rollout tasks (gen_avoid_scenes layout):")
+        print("Rollout tasks (registry='%s'):" % registry_label)
         for task in task_registry.values():
             print(
                 f"  {task.name:<20} suite={task.suite:<6} "
@@ -1023,10 +1065,9 @@ def main() -> None:
         p.error("--render-warmup-frames must be >= 1")
     if a.lstm_reset_interval < 0:
         p.error("--lstm-reset-interval must be >= 0")
-    task_selector = a.tasks.strip().lower()
     if task_selector == "all":
         selected_tasks = list(task_registry.values())
-    elif task_selector in ("avoid",):
+    elif task_selector in _TASK_REGISTRY_BUILDERS:
         selected_tasks = [task for task in task_registry.values()
                           if task.suite == task_selector]
     else:
@@ -1089,7 +1130,7 @@ def main() -> None:
         _ = student.step(
             torch.ones(1, 1, mc.image_height, mc.image_width,
                        device=dev, dtype=torch.float32),
-            torch.zeros(1, 11, device=dev, dtype=torch.float32),
+            torch.zeros(1, mc.state_dim, device=dev, dtype=torch.float32),
             student.initial_hidden(1, device=dev, dtype=torch.float32))
     if dev.type == "cuda":
         torch.cuda.synchronize()
@@ -1106,7 +1147,7 @@ def main() -> None:
     print(f"  Depth:       {a.depth_width}x{a.depth_height} max={a.depth_max_m}m")
     print(f"  Ports:       PUB={a.pub_port} SUB={a.sub_port}")
     print(f"  Params:      {sum(p.numel() for p in student.parameters()):,}")
-    print(f"  State:       11-D schema-v25, scale={hr_cfg.state_scale}")
+    print(f"  State:       7-D (gravity+goal), scale={hr_cfg.state_scale}")
 
     log_metadata = {
         "format_version": 1,

@@ -16,8 +16,9 @@ import torch
 import torch.nn.functional as F
 
 from dataloader import (AVOIDANCE_MODES, COMMAND_SCALE, HIERARCHICAL_MODES,
-                        SCHEMA_VERSION, STATE_FIELDS, TARGET_FIELDS,
-                        build_dataloaders, discover_committed_episodes)
+                        SCHEMA_VERSION, STATE_FIELDS, STATE_SCALE,
+                        TARGET_FIELDS, build_dataloaders,
+                        discover_committed_episodes)
 from model.model import ViTFlyLSTMPolicy, ViTFlyPolicyConfig
 
 
@@ -99,7 +100,7 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def compute_loss(normalized_prediction: torch.Tensor,
                  normalized_target: torch.Tensor, loss_mask: torch.Tensor,
-                 hierarchical_mode: torch.Tensor, smoothness_weight: float = 0.1
+                 hierarchical_mode: torch.Tensor, smoothness_weight: float = 0.05
                  ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     # Rare decision states deserve more weight without exposing them to the
     # policy: hierarchical_mode is used only by the loss.
@@ -122,7 +123,20 @@ def compute_loss(normalized_prediction: torch.Tensor,
     element = F.smooth_l1_loss(
         normalized_prediction, normalized_target, reduction="none", beta=0.1)
     velocity = masked_mean(element[..., :3], weighted_mask)
-    yaw = masked_mean(element[..., 3:], weighted_mask)
+    # ── yaw 收缩补偿（2026-08-27）────────────────────────────────
+    # 诊断：yaw_rate 分布极不均衡（大量 0 直飞 + 少数 ±1.5 转向），MSE 下模型
+    # yaw 向 0 收缩（右侧目标 [0.2,0.4) 桶学生 yaw 只有专家的 1.5%），导致避障
+    # 转向不足 → rollout 7 碰撞 / 7 超时。对策（镜像 velocity 补偿）：
+    #   1) |专家 yaw| > 0.3 rad/s 的帧（需要转向）→ yaw 损失 ×3；
+    #   2) TURN 帧（mode 3/4，gdn==1 纯旋转）→ yaw 损失 ×2，消除 std 摆动。
+    yaw_mask = weighted_mask
+    expert_yaw = normalized_target[..., 3] * COMMAND_SCALE[3]
+    big_yaw = (torch.abs(expert_yaw) > 0.3).to(normalized_target.dtype)
+    yaw_mask = yaw_mask * (1.0 + 2.0 * big_yaw)          # |yaw|>0.3 → ×3
+    turn = ((hierarchical_mode == 3) | (hierarchical_mode == 4)).to(
+        normalized_target.dtype)
+    yaw_mask = yaw_mask * (1.0 + 1.0 * turn)             # TURN → ×2
+    yaw = masked_mean(element[..., 3:], yaw_mask)
     if normalized_prediction.shape[1] > 1:
         pred_delta = normalized_prediction[:, 1:] - normalized_prediction[:, :-1]
         target_delta = normalized_target[:, 1:] - normalized_target[:, :-1]
@@ -189,7 +203,7 @@ def _remember_hidden(batch: Dict[str, object],
 def run_epoch(model: ViTFlyLSTMPolicy, loader: Iterable,
               device: torch.device, optimizer=None, scaler=None,
               scheduler=None, amp: bool = False, grad_clip: float = 1.0,
-              smoothness_weight: float = 0.1,
+              smoothness_weight: float = 0.05,
               stateful: bool = True) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -272,8 +286,7 @@ def save_checkpoint(path: Path, model: ViTFlyLSTMPolicy, optimizer,
         "target_fields": list(TARGET_FIELDS),
         "normalization": {
             "depth_max_m": 5.0,
-            "state_scale": [1.0, 1.0, 1.0, 2.5, 2.5, 2.5, 1.5,
-                            1.0, 1.0, 1.0, 1.0],
+            "state_scale": STATE_SCALE.tolist(),
             "command_scale": COMMAND_SCALE.tolist(),
         },
         "split": {
@@ -303,7 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=float, default=2.0)
-    parser.add_argument("--smoothness-weight", type=float, default=0.1)
+    parser.add_argument("--smoothness-weight", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

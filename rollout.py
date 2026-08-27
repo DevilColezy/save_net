@@ -49,12 +49,10 @@ SCHEMA_VERSION = 25
 EXPECTED_ARCHITECTURE = "ViTFlyLSTMPolicy"
 EXPECTED_STATE_FIELDS = (
     "gravity_flu_x", "gravity_flu_y", "gravity_flu_z",
-    "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
-    "yaw_rate_flu", "goal_direction_flu_x", "goal_direction_flu_y",
-    "goal_direction_flu_z", "goal_distance_norm",
+    "goal_direction_flu_x", "goal_direction_flu_y", "goal_direction_flu_z",
+    "goal_distance_norm",
 )
-DEFAULT_STATE_SCALE = (1.0, 1.0, 1.0, 2.5, 2.5, 2.5, 1.5,
-                       1.0, 1.0, 1.0, 1.0)
+DEFAULT_STATE_SCALE = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
 def _load_model_from_file(model_file: str) -> Tuple[Any, Any]:
@@ -109,9 +107,11 @@ def load_policy_checkpoint(checkpoint_file: str, model_file: str,
             f"checkpoint depth_max_m={checkpoint_depth_max}")
     state_scale = tuple(float(value) for value in
                         normalization.get("state_scale", DEFAULT_STATE_SCALE))
-    if len(state_scale) != 11 or min(state_scale) <= 0.0:
+    if len(state_scale) != len(EXPECTED_STATE_FIELDS) or \
+            min(state_scale) <= 0.0:
         raise ValueError(
-            "checkpoint normalization.state_scale must have 11 positives")
+            "checkpoint normalization.state_scale must have %d positives"
+            % len(EXPECTED_STATE_FIELDS))
     config_dict = checkpoint.get("model_config") or {}
     model_config = CC(**config_dict) if config_dict else CC()
     model_config.validate()
@@ -650,24 +650,24 @@ def preprocess_depth(depth_normalized: np.ndarray,
 
 
 def build_normalized_state(gravity_flu: np.ndarray,
-                           velocity_flu: np.ndarray, yaw_rate: float,
                            goal_direction_flu: np.ndarray,
                            goal_distance_norm: float,
                            state_scale: Tuple[float, ...],
                            device: torch.device) -> torch.Tensor:
-    """Construct the exact schema-v25 11-D student state in field order."""
+    """Construct the 7-D student state in field order (gravity 3 + goal
+    direction 3 + goal distance 1).  velocity_flu / yaw_rate_flu inputs were
+    REMOVED (2026-08-26) so the policy cannot short-circuit on current motion
+    and must read the depth image for avoidance."""
     raw = np.concatenate((
         np.asarray(gravity_flu, dtype=np.float32).reshape(3),
-        np.asarray(velocity_flu, dtype=np.float32).reshape(3),
-        np.asarray([yaw_rate], dtype=np.float32),
         np.asarray(goal_direction_flu, dtype=np.float32).reshape(3),
         np.asarray([goal_distance_norm], dtype=np.float32),
     ))
     scale = np.asarray(state_scale, dtype=np.float32)
-    if raw.shape != (11,) or scale.shape != (11,) or np.any(scale <= 0.0):
-        raise ValueError("schema-v25 state and state_scale must contain 11 values")
+    if raw.shape != (7,) or scale.shape != (7,) or np.any(scale <= 0.0):
+        raise ValueError("state and state_scale must contain 7 values")
     if not np.isfinite(raw).all():
-        raise ValueError("non-finite schema-v25 rollout state")
+        raise ValueError("non-finite rollout state")
     return torch.from_numpy(raw / scale)[None].to(device=device)
 
 
@@ -906,7 +906,7 @@ def run_rollout(
             dtype=np.float32)
         yr = float(omega_flu[2])
         state_tensor = build_normalized_state(
-            grav_flu, stt.velocity_flu, yr, gf, float(gdn),
+            grav_flu, gf, float(gdn),
             rollout_cfg.state_scale, device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -1152,7 +1152,7 @@ def main() -> None:
         _ = model.step(
             torch.ones(1, 1, mc.image_height, mc.image_width,
                        device=dev, dtype=torch.float32),
-            torch.zeros(1, 11, device=dev, dtype=torch.float32),
+            torch.zeros(1, mc.state_dim, device=dev, dtype=torch.float32),
             model.initial_hidden(1, device=dev, dtype=torch.float32))
     if dev.type == "cuda":
         torch.cuda.synchronize()
@@ -1182,7 +1182,7 @@ def main() -> None:
     print(f"  Ports:       PUB={cf.pub_port} SUB={cf.sub_port}")
     print(f"  Params:      {sum(p.numel() for p in model.parameters()):,}")
     print(f"  Model image: {(mc.image_height, mc.image_width)}")
-    print(f"  State:       11-D schema-v25, scale={cf.state_scale}")
+    print(f"  State:       {len(cf.state_scale)}-D (gravity+goal), scale={cf.state_scale}")
     log_metadata = {
         "format_version": 1,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),

@@ -18,7 +18,7 @@ import torch.nn.functional as F
 class ViTFlyPolicyConfig:
     image_height: int = 60
     image_width: int = 90
-    state_dim: int = 11
+    state_dim: int = 7
     stage_dims: Tuple[int, int] = (32, 64)
     stage_depths: Tuple[int, int] = (2, 2)
     stage_heads: Tuple[int, int] = (1, 2)
@@ -29,10 +29,19 @@ class ViTFlyPolicyConfig:
     lstm_layers: int = 3
     dropout: float = 0.1
     command_scale: Tuple[float, float, float, float] = (2.5, 2.5, 2.5, 1.5)
+    # Visual-feature scale alignment (2026-08-26): the Mix-Transformer visual
+    # embedding sat ~0.13 std while the state encoder sat ~0.35 std, so the
+    # LSTM was driven almost entirely by the state branch and the depth
+    # response vanished.  Scale the visual embedding to match the state
+    # branch so the policy actually reads the depth image.
+    visual_scale: float = 3.0
 
     def validate(self) -> None:
-        if self.state_dim != 11:
-            raise ValueError("schema v25 requires exactly 11 non-visual inputs")
+        if self.state_dim != 7:
+            raise ValueError(
+                "30 Hz policy requires exactly 7 non-visual inputs "
+                "(gravity 3 + goal direction 3 + goal distance 1); "
+                "velocity/yaw_rate inputs removed 2026-08-26")
         if self.image_height < 16 or self.image_width < 16:
             raise ValueError("image size is too small")
         if not (len(self.stage_dims) == len(self.stage_depths) ==
@@ -191,13 +200,15 @@ class ViTFlyLSTMPolicy(nn.Module):
             raise ValueError("depth must have shape [B,T,1,H,W]")
         if state.ndim != 3 or state.shape[:2] != depth.shape[:2] or \
                 state.shape[-1] != self.config.state_dim:
-            raise ValueError("state must have shape [B,T,11]")
+            raise ValueError(
+                "state must have shape [B,T,%d]" % self.config.state_dim)
         b, t = depth.shape[:2]
         frames = depth.reshape(b * t, 1, depth.shape[-2], depth.shape[-1])
         frames = F.interpolate(
             frames, size=(self.config.image_height, self.config.image_width),
             mode="bilinear", align_corners=False)
         visual = self.visual(frames).reshape(b, t, -1)
+        visual = visual * self.config.visual_scale
         state_features = self.state_encoder(state.reshape(b * t, -1)).reshape(b, t, -1)
         recurrent, hidden_out = self.lstm(
             torch.cat((visual, state_features), dim=-1), hidden)
