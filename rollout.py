@@ -171,12 +171,13 @@ class RolloutConfig:
     pub_port: str = "10253"
     sub_port: str = "10254"
     scene_id: int = 1
-    # Collector defaults: 640x480, fov=90, near=0.01, far=1000.0, max_m=5.0
+    # Collector defaults: 640x360, vertical fov=58 (D435i full-H), near=0.28,
+    # far=10.0, max_m=5.0
     depth_width: int = 640
-    depth_height: int = 480
-    depth_fov: float = 90.0
-    depth_near: float = 0.01
-    depth_far: float = 1000.0
+    depth_height: int = 360
+    depth_fov: float = 58.0
+    depth_near: float = 0.28
+    depth_far: float = 10.0
     depth_max_m: float = 5.0
     # Collector: record_hz=30, control_hz=50
     model_hz: float = 30.0
@@ -203,13 +204,56 @@ class RolloutConfig:
 
 @dataclass(frozen=True)
 class Cylinder:
-    """A deterministic vertical cylinder in world coordinates."""
+    """A deterministic vertical cylinder in world coordinates.
+
+    When ``half_w`` / ``half_h`` are both > 0 the obstacle is instead
+    rendered as an AABB BOX (Unity ``Transparen_Cube`` prefab) of size
+    ``2*half_w x height x 2*half_h`` centred on (x, y) — the same box
+    representation the collection pipeline uses for rectangular obstacles.
+    ``radius`` is then ignored for rendering (kept for truth/geometry).
+    """
 
     x: float
     y: float
     radius: float
     height: float = 8.0
     base_z: float = 0.0
+    half_w: float = 0.0
+    half_h: float = 0.0
+
+    @property
+    def is_box(self) -> bool:
+        return self.half_w > 0.0 and self.half_h > 0.0
+
+    def min_dist_to_point(self, px: float, py: float) -> float:
+        """Euclidean distance from (px, py) to the obstacle surface."""
+        if self.is_box:
+            dx = max(abs(px - self.x) - self.half_w, 0.0)
+            dy = max(abs(py - self.y) - self.half_h, 0.0)
+            return math.hypot(dx, dy)
+        return max(math.hypot(px - self.x, py - self.y) - self.radius, 0.0)
+
+    def surface_gap(self, other: "Cylinder") -> float:
+        """Surface gap to another obstacle (negative => overlap)."""
+        if self.is_box or other.is_box:
+            # Axis-aligned boxes: gap along each axis, 0 if separated diagonally.
+            if self.is_box and other.is_box:
+                gap_x = abs(self.x - other.x) - (self.half_w + other.half_w)
+                gap_y = abs(self.y - other.y) - (self.half_h + other.half_h)
+                if gap_x <= 0 and gap_y <= 0:
+                    return -math.hypot(gap_x, gap_y)
+                if gap_x <= 0:
+                    return gap_y
+                if gap_y <= 0:
+                    return gap_x
+                return math.hypot(gap_x, gap_y)
+            box, cyl = (self, other) if self.is_box else (other, self)
+            dx = max(abs(box.x - cyl.x) - box.half_w, 0.0)
+            dy = max(abs(box.y - cyl.y) - box.half_h, 0.0)
+            return max(math.hypot(dx, dy) - cyl.radius, 0.0)
+        return max(
+            math.hypot(self.x - other.x, self.y - other.y)
+            - self.radius - other.radius, 0.0)
 
 
 @dataclass(frozen=True)
@@ -230,6 +274,10 @@ class RolloutTask:
     # Scene number in an external manifest.  This is intentionally separate
     # from the Unity scene selected by the rollout CLI.
     scene_id: Optional[int] = None
+    # Per-obstacle "wall" flag: True for cylinders that form one continuous
+    # wall (they may touch each other AND other obstacles may hug them — only
+    # non-wall obstacle pairs are held to minimum_surface_gap_m).
+    wall_flags: Tuple[bool, ...] = ()
 
 
 # il_dataset_config.yaml: scene_generation.obstacle_region and the primary
@@ -384,11 +432,24 @@ def build_task_registry() -> Dict[str, RolloutTask]:
 def validate_task_registry(
     tasks: Dict[str, RolloutTask], drone_radius: float, safety_margin: float,
     minimum_surface_gap_m: float = 1.20,
+    workspace_bounds: Optional[Tuple[float, ...]] = None,
+    obstacle_bounds: Optional[Tuple[float, ...]] = None,
+    wall_touch_tolerance_m: float = 0.0,
 ) -> None:
-    """Fail fast on malformed tasks or unsafe endpoints."""
+    """Fail fast on malformed tasks or unsafe endpoints.
+
+    ``workspace_bounds`` / ``obstacle_bounds`` override the default low-
+    altitude rollout workspace (ROLLOUT_WORKSPACE_BOUNDS and
+    COLLECTION_OBSTACLE_BOUNDS); pass larger bounds for outdoor high-altitude
+    test scenes (e.g. region [-25,25] x [-25,25] at z ~ 15 m).
+    """
     if not tasks:
         raise ValueError("The rollout task registry is empty")
     clearance = drone_radius + safety_margin
+    ws_bounds = (workspace_bounds if workspace_bounds is not None
+                 else ROLLOUT_WORKSPACE_BOUNDS)
+    obs_bounds = (obstacle_bounds if obstacle_bounds is not None
+                  else COLLECTION_OBSTACLE_BOUNDS)
     for key, task in tasks.items():
         if key != task.name:
             raise ValueError(f"Task registry key/name mismatch: {key}/{task.name}")
@@ -398,9 +459,9 @@ def validate_task_registry(
             raise ValueError(f"Task {key}: start/goal must be finite")
         if np.linalg.norm(goal - start) < 1.0:
             raise ValueError(f"Task {key}: start and goal are too close")
-        if not _point_in_bounds(start, ROLLOUT_WORKSPACE_BOUNDS):
+        if not _point_in_bounds(start, ws_bounds):
             raise ValueError(f"Task {key}: start is outside rollout workspace")
-        if not _point_in_bounds(goal, ROLLOUT_WORKSPACE_BOUNDS):
+        if not _point_in_bounds(goal, ws_bounds):
             raise ValueError(f"Task {key}: goal is outside rollout workspace")
         endpoints = [("start", start), ("goal", goal)]
         previous_time = -1.0
@@ -409,19 +470,24 @@ def validate_task_registry(
             if update_time < 0.0 or update_time <= previous_time:
                 raise ValueError(f"Task {key}: goal update times must increase")
             if not np.all(np.isfinite(update_point)) or not _point_in_bounds(
-                    update_point, ROLLOUT_WORKSPACE_BOUNDS):
+                    update_point, ws_bounds):
                 raise ValueError(f"Task {key}: invalid goal update {update_index}")
             endpoints.append((f"goal_update_{update_index}", update_point))
             previous_time = update_time
         for obstacle in task.obstacles:
-            if obstacle.radius <= 0.0 or obstacle.height <= 0.0:
+            hw = obstacle.half_w if obstacle.is_box else obstacle.radius
+            hh = obstacle.half_h if obstacle.is_box else obstacle.radius
+            if obstacle.height <= 0.0 or \
+                    (obstacle.is_box and (obstacle.half_w <= 0.0
+                                          or obstacle.half_h <= 0.0)) or \
+                    (not obstacle.is_box and obstacle.radius <= 0.0):
                 raise ValueError(f"Task {key}: obstacle dimensions must be positive")
-            obstacle_bounds = COLLECTION_OBSTACLE_BOUNDS
+            obstacle_bounds = obs_bounds
             if not (
-                obstacle.x - obstacle.radius >= obstacle_bounds[0] and
-                obstacle.x + obstacle.radius <= obstacle_bounds[1] and
-                obstacle.y - obstacle.radius >= obstacle_bounds[2] and
-                obstacle.y + obstacle.radius <= obstacle_bounds[3] and
+                obstacle.x - hw >= obstacle_bounds[0] and
+                obstacle.x + hw <= obstacle_bounds[1] and
+                obstacle.y - hh >= obstacle_bounds[2] and
+                obstacle.y + hh <= obstacle_bounds[3] and
                 obstacle.base_z >= obstacle_bounds[4] and
                 obstacle.base_z + obstacle.height <= obstacle_bounds[5]
             ):
@@ -432,21 +498,33 @@ def validate_task_registry(
                     obstacle.base_z - clearance <= endpoint[2] <=
                     obstacle.base_z + obstacle.height + clearance
                 )
-                planar_distance = np.linalg.norm(
-                    endpoint[:2] - np.array([obstacle.x, obstacle.y]))
-                if within_height and planar_distance <= obstacle.radius + clearance:
+                dist = obstacle.min_dist_to_point(
+                    float(endpoint[0]), float(endpoint[1]))
+                if within_height and dist <= clearance:
                     raise ValueError(
                         f"Task {key}: {label} intersects an inflated obstacle")
-        for first_index, first in enumerate(task.obstacles):
-            for second in task.obstacles[first_index + 1:]:
+        wall_flags = task.wall_flags or ()
+        obs_list = list(task.obstacles)
+        for first_index, first in enumerate(obs_list):
+            for second_index in range(first_index + 1, len(obs_list)):
+                second = obs_list[second_index]
+                # A wall cylinder is part of one continuous structure: it may
+                # touch other wall cylinders and other obstacles may hug it.
+                if (first_index < len(wall_flags) and wall_flags[first_index]) \
+                        or (second_index < len(wall_flags)
+                            and wall_flags[second_index]):
+                    continue
                 vertical_overlap = not (
                     first.base_z + first.height <= second.base_z or
                     second.base_z + second.height <= first.base_z)
                 if not vertical_overlap:
                     continue
-                center_distance = math.hypot(first.x - second.x,
-                                             first.y - second.y)
-                surface_gap = center_distance - first.radius - second.radius
+                surface_gap = first.surface_gap(second)
+                # Tangent / overlapping obstacles are allowed when they form
+                # one continuous wall (e.g. 20 m wall made of tangent cyls).
+                if wall_touch_tolerance_m > 0.0 and \
+                        surface_gap < wall_touch_tolerance_m:
+                    continue
                 if surface_gap + 1e-9 < minimum_surface_gap_m:
                     raise ValueError(
                         f"Task {key}: obstacle surface gap {surface_gap:.3f} m "
@@ -470,19 +548,30 @@ def task_to_unity_objects(
                 float(obstacle.base_z + obstacle.height / 2.0),
                 float(obstacle.y),
             ]
-            size = [
-                2.0 * float(obstacle.radius),
-                float(obstacle.height),
-                2.0 * float(obstacle.radius),
-            ]
+            if obstacle.is_box:
+                # AABB box (same prefab the collection pipeline uses).
+                prefab = "Transparen_Cube"
+                size = [
+                    2.0 * float(obstacle.half_w),
+                    float(obstacle.height),
+                    2.0 * float(obstacle.half_h),
+                ]
+            else:
+                prefab = "Object"
+                size = [
+                    2.0 * float(obstacle.radius),
+                    float(obstacle.height),
+                    2.0 * float(obstacle.radius),
+                ]
         else:
             # Unity keeps dynamically created IDs alive. Moving every unused
             # stable slot prevents geometry from a previous task leaking in.
             position = [1000.0 + index, -1000.0, 1000.0]
             size = [0.01, 0.01, 0.01]
+            prefab = "Object"
         result.append({
             "ID": f"rollout_obstacle_{index:02d}",
-            "prefabID": "Object",
+            "prefabID": prefab,
             "position": position,
             "rotation": [0.0, 0.0, 0.0, 1.0],
             "size": size,
@@ -691,14 +780,13 @@ def active_goal_for_time(task: RolloutTask, sim_time_s: float,
 
 def body_clearance(position: np.ndarray, task: RolloutTask,
                    drone_radius: float) -> float:
-    """Analytic clearance from vehicle surface to the nearest cylinder."""
+    """Analytic clearance from vehicle surface to the nearest obstacle."""
     values = []
     for obstacle in task.obstacles:
         if obstacle.base_z - drone_radius <= position[2] <= \
                 obstacle.base_z + obstacle.height + drone_radius:
-            values.append(math.hypot(position[0] - obstacle.x,
-                                     position[1] - obstacle.y) -
-                          obstacle.radius - drone_radius)
+            values.append(obstacle.min_dist_to_point(
+                float(position[0]), float(position[1])) - drone_radius)
     return min(values) if values else float("inf")
 
 
@@ -1059,8 +1147,8 @@ def main() -> None:
     )
     p.add_argument("--max-yaw-rate", type=float, default=2.0)
     p.add_argument("--depth-width", type=int, default=640)
-    p.add_argument("--depth-height", type=int, default=480)
-    p.add_argument("--depth-fov", type=float, default=90.0)
+    p.add_argument("--depth-height", type=int, default=360)
+    p.add_argument("--depth-fov", type=float, default=58.0)
     p.add_argument("--depth-max-m", type=float, default=5.0)
     p.add_argument(
         "--render-warmup-frames", type=int, default=5,

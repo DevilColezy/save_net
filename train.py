@@ -328,6 +328,11 @@ def build_parser() -> argparse.ArgumentParser:
              "by default because symmetric obstacle scenes can have a "
              "deterministic expert side preference")
     parser.add_argument(
+        "--depth-noise-std-ratio", type=float, default=0.02,
+        help="D435i sim-to-real multiplicative Gaussian depth noise applied "
+             "at training time (sigma = ratio * normalized depth).  0.02 = "
+             "D435i <2%% @2m.  The val loader always uses 0.")
+    parser.add_argument(
         "--stateless-windows", action="store_true",
         help="use legacy independent windows and burn-in instead of stateful TBPTT")
     parser.add_argument("--resume", default="")
@@ -357,7 +362,8 @@ def main() -> None:
         workers=args.workers,
         balanced_sampling=not args.no_balanced_sampling,
         stateful=not args.stateless_windows,
-        mirror_augmentation=args.mirror_augmentation)
+        mirror_augmentation=args.mirror_augmentation,
+        depth_noise_std_ratio=args.depth_noise_std_ratio)
     if args.stateless_windows:
         print("training mode: independent windows with %d-frame burn-in" %
               args.burn_in)

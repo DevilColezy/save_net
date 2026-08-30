@@ -1,14 +1,21 @@
 # v25 depth-to-control policy
 
 This package trains two causal students for the hierarchical expert: a
-**30 Hz local-avoidance student** and a **5 Hz upper-planner student**.
+**30 Hz local-avoidance student** and a **5 Hz upper-planner student**,
 on the non-privileged contract written by `il_dataset` schema v25:
 
-- input: one depth image plus gravity direction (3), current FLU velocity
-  (3), yaw rate (1), FLU goal direction (3), and clipped goal distance (1);
-- output: FLU velocity `(vx, vy, vz)` and yaw rate;
+- input: one depth image (640×360 D435i, normalised to [0,1], internally
+  resized to 60×90) plus a **7-D state**: gravity direction (3) + goal
+  direction (3) + clipped goal distance (1).  Velocity / yaw-rate inputs
+  were **removed** (2026-08-26) so the policy must read depth for avoidance;
+- output (30 Hz): FLU velocity `(vx, vy, vz)` + yaw rate, produced as
+  `normalized × command_scale` with `command_scale = [2.5, 2.5, 2.5, 1.5]`;
 - network: two-stage overlapping Mix-Transformer visual encoder, state MLP,
-  and a three-layer LSTM inspired by ViTFly.
+  and a two-layer LSTM inspired by ViTFly.
+
+> **最新发布模型**：两个最新训练的模型（30 Hz v31 + 5 Hz macro_v5）位于
+> [`released_models/`](released_models/README.md)，那里有完整的输入输出、
+> 深度/状态归一化、特殊语义（PASS/NORMAL/TURN 解码）与推理示例。
 
 `train.py` trains only the 30 Hz local policy.  `train_macro.py` trains the
 5 Hz macro policy from the same committed episodes.  The two trainers have
@@ -74,6 +81,12 @@ policy has passed the centred-pillar rollout tasks.
 
 ## 5 Hz upper-planner network
 
+> **当前实现（R31）**：`MacroPlannerPolicy` 是**纯回归**——输入 7-D 状态
+> （gravity 3 + **原始**导航目标方向 3 + 归一化距离 1），输出修正目标的
+> 单位 FLU 方向 + sigmoid 归一化距离，**没有 PASS/NORMAL/TURN 类型头**。
+> 方向≈原目标 ⇒ PASS，偏离 ⇒ NORMAL，距离≈1.0 ⇒ 纯旋转（TURN 左右按方向判定）。
+> 下面旧描述（类型 token）是历史版本，仅供参考。
+
 The dataset carries real 5 Hz directives every 6 committed frames
 (`macro_update_mask==1` on `episode_frame_index % 6 == 0`).  The macro loader
 filters those rows before constructing windows; it never trains on the six
@@ -130,6 +143,33 @@ therefore covers altitude stabilization/transients, not learned over/under
 obstacle avoidance. Adding true 3D avoidance requires a 3D expert and partial-
 height scene distribution together; changing only obstacle heights would make
 the labels inconsistent.
+
+## Released models
+
+两个最新发布模型（训练于 `il_data_d435i_col_v3_complete`，554 ep / 46 scenes）：
+
+| 文件 | 架构 | 作用 |
+|------|------|------|
+| `released_models/30hz_v31_v3complete_mirror_nonoise_best.pt` | `ViTFlyLSTMPolicy` | 30 Hz 局部避障学生 |
+| `released_models/5hz_macro_v5_v3complete_mirror_nonoise_best.pt` | `MacroPlannerPolicy` | 5 Hz 上层规划学生 |
+
+完整文档（输入输出字段、深度/状态归一化、command_scale、PASS/NORMAL/TURN 语义、
+推理示例、checkpoint 结构、已知边界）见
+**[`released_models/README.md`](released_models/README.md)**。
+
+快速闭环使用：
+
+```bash
+# 30 Hz 学生单独
+python3 rollout.py --checkpoint released_models/30hz_v31_v3complete_mirror_nonoise_best.pt \
+  --depth-fov 58.0 --depth-near 0.28 --depth-far 10.0 --depth-max-m 5.0
+
+# 5 Hz 学生 + 30 Hz 学生（完整学习栈）
+python3 rollout_stack.py --stack student5_student30 \
+  --checkpoint released_models/30hz_v31_v3complete_mirror_nonoise_best.pt \
+  --macro-checkpoint released_models/5hz_macro_v5_v3complete_mirror_nonoise_best.pt \
+  --expert-config ../il_dataset/config/il_dataset_joint_v2_config.yaml
+```
 
 ## Closed-loop rollout
 

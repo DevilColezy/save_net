@@ -24,7 +24,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from dataloader import (MACRO_STATE_FIELDS, MACRO_TYPE_TO_INDEX, SCHEMA_VERSION,
+from dataloader import (MACRO_STATE_FIELDS, MACRO_STATE_SCALE,
+                        MACRO_TYPE_TO_INDEX, SCHEMA_VERSION,
                         build_macro_dataloaders, discover_committed_episodes)
 from model.model import MacroPlannerPolicy, MacroPolicyConfig
 
@@ -57,8 +58,8 @@ def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 def compute_macro_loss(output, batch: Dict[str, torch.Tensor],
                        direction_weight: float = 1.0,
                        distance_weight: float = 0.5,
-                       pass_weight: float = 0.5,
-                       correction_weight: float = 2.0):
+                       pass_weight: float = 0.15,
+                       correction_weight: float = 4.0):
     """Regression loss for the corrected-target student (no type/token).
 
     Every row is supervised on the corrected FLU direction + normalized
@@ -67,6 +68,11 @@ def compute_macro_loss(output, batch: Dict[str, torch.Tensor],
     expert macro_correction_type is used ONLY as a loss weight — never a
     network input or output — so the sparse NORMAL/TURN corrections are not
     drowned out by the dominant PASS class.
+    R31: PASS ≈ 88% of macro decisions (col_4: 20200/22911).  With the old
+    0.5/2.0 weighting the correction rows contributed only ~35% of the
+    loss, so the cheapest strategy was to always copy the original goal.
+    The weights 0.15/4.0 push corrections to ~78% of the loss so the
+    network is forced to learn real corrections from depth.
     """
     mask = batch["loss_mask"] > 0.5
     if not mask.any():
@@ -208,8 +214,7 @@ def save_checkpoint(path: Path, model: MacroPlannerPolicy, optimizer,
                           "macro_direction_flu_z", "macro_distance_norm"],
         "normalization": {
             "depth_max_m": 5.0,
-            "macro_state_scale": [1.0, 1.0, 1.0, 2.5, 2.5, 2.5, 1.5,
-                                   1.0, 1.0, 1.0, 1.0],
+            "macro_state_scale": [float(v) for v in MACRO_STATE_SCALE],
             "macro_type_names": ["PASS_THROUGH", "NORMAL_CORRECTION",
                                   "TURN_LEFT", "TURN_RIGHT"],
         },
@@ -248,6 +253,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-balanced-sampling", action="store_true")
     parser.add_argument("--mirror-augmentation", action="store_true")
+    parser.add_argument(
+        "--depth-noise-std-ratio", type=float, default=0.02,
+        help="D435i sim-to-real multiplicative Gaussian depth noise applied "
+             "at training time (sigma = ratio * normalized depth).  The val "
+             "loader always uses 0.")
     parser.add_argument("--stateless-windows", action="store_true")
     parser.add_argument("--resume", default="")
     parser.add_argument("--audit-only", action="store_true")
@@ -271,7 +281,8 @@ def main() -> None:
         workers=args.workers,
         balanced_sampling=not args.no_balanced_sampling,
         stateful=not args.stateless_windows,
-        mirror_augmentation=args.mirror_augmentation)
+        mirror_augmentation=args.mirror_augmentation,
+        depth_noise_std_ratio=args.depth_noise_std_ratio)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")

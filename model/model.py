@@ -240,7 +240,9 @@ class MacroPolicyConfig:
 
     image_height: int = 60
     image_width: int = 90
-    state_dim: int = 11
+    # R31: 7-D macro state = gravity(3) + ORIGINAL goal(4); velocity/yaw_rate
+    # removed so the 5 Hz policy must read depth, not short-circuit on motion.
+    state_dim: int = 7
     stage_dims: Tuple[int, int] = (32, 64)
     stage_depths: Tuple[int, int] = (2, 2)
     stage_heads: Tuple[int, int] = (1, 2)
@@ -252,8 +254,9 @@ class MacroPolicyConfig:
     dropout: float = 0.1
 
     def validate(self) -> None:
-        if self.state_dim != 11:
-            raise ValueError("schema v25 macro state requires 11 inputs")
+        if self.state_dim != 7:
+            raise ValueError("R31 macro state requires 7 inputs (gravity 3 + "
+                             "original goal 4)")
         if self.image_height < 16 or self.image_width < 16:
             raise ValueError("image size is too small")
         if not (len(self.stage_dims) == len(self.stage_depths) ==

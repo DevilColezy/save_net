@@ -464,10 +464,10 @@ class HierarchicalRolloutConfig:
     sub_port: str = "10254"
     scene_id: int = 1
     depth_width: int = 640
-    depth_height: int = 480
-    depth_fov: float = 90.0
-    depth_near: float = 0.01
-    depth_far: float = 1000.0
+    depth_height: int = 360
+    depth_fov: float = 58.0   # VERTICAL FOV = D435i depth ~58°
+    depth_near: float = 0.28  # D435i Min-Z
+    depth_far: float = 10.0   # D435i effective range
     depth_max_m: float = 5.0
     # The authoritative camera->body matrix (16 floats row-major) from the
     # expert YAML's global.depth.t_bc; used by every make_depth_vehicle call.
@@ -1002,10 +1002,10 @@ def main() -> None:
     p.add_argument("--lstm-reset-interval", type=int, default=0)
     p.add_argument("--max-yaw-rate", type=float, default=2.0)
     p.add_argument("--depth-width", type=int, default=640)
-    p.add_argument("--depth-height", type=int, default=480)
-    p.add_argument("--depth-fov", type=float, default=90.0)
-    p.add_argument("--depth-near", type=float, default=0.01)
-    p.add_argument("--depth-far", type=float, default=1000.0)
+    p.add_argument("--depth-height", type=int, default=360)
+    p.add_argument("--depth-fov", type=float, default=58.0)
+    p.add_argument("--depth-near", type=float, default=0.28)
+    p.add_argument("--depth-far", type=float, default=10.0)
     p.add_argument("--depth-max-m", type=float, default=5.0)
     p.add_argument("--render-warmup-frames", type=int, default=5)
     p.add_argument("--flight-z", type=float, default=2.0)

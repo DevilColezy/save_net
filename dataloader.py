@@ -64,16 +64,19 @@ STATE_SCALE = np.asarray(
 # goal.  It must not use goal_direction_flu_* (the effective 30 Hz target),
 # otherwise the upper network would learn the expert's already-corrected
 # answer instead of deciding whether correction is needed.
+# R31: velocity + yaw_rate REMOVED from the macro state (11-D -> 7-D).  The
+# 5 Hz decision must read the DEPTH to decide whether to correct — velocity/
+# yaw_rate are naturally elevated on a TURN decision row, so including them
+# lets the network short-circuit on its own motion and ignore depth, which
+# collapses it into an always-PASS copy of the original goal.
 MACRO_STATE_FIELDS = (
     "gravity_flu_x", "gravity_flu_y", "gravity_flu_z",
-    "velocity_flu_x", "velocity_flu_y", "velocity_flu_z",
-    "yaw_rate_flu",
     "navigation_goal_direction_flu_x",
     "navigation_goal_direction_flu_y", "navigation_goal_direction_flu_z",
     "navigation_goal_distance_norm",
 )
 MACRO_STATE_SCALE = np.asarray(
-    [1.0, 1.0, 1.0, 2.5, 2.5, 2.5, 1.5, 1.0, 1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
     dtype=np.float32)
 COMMAND_SCALE = np.asarray([2.5, 2.5, 2.5, 1.5], dtype=np.float32)
 # The FULL new-architecture expert state (no lossy legacy projection).
@@ -384,7 +387,8 @@ class V25SequenceDataset(Dataset):
     def __init__(self, episodes: Sequence[EpisodeInfo], sequence_length: int = 32,
                  burn_in: int = 8, stride: Optional[int] = None,
                  max_depth_m: float = 5.0, augment: bool = False,
-                 cache_episodes: int = 8, stateful: bool = False):
+                 cache_episodes: int = 8, stateful: bool = False,
+                 depth_noise_std_ratio: float = 0.0):
         self.episodes = list(episodes)
         self.sequence_length = int(sequence_length)
         self.burn_in = int(burn_in)
@@ -398,6 +402,7 @@ class V25SequenceDataset(Dataset):
         self.total_length = self.context_burn_in + self.sequence_length
         self.max_depth_m = float(max_depth_m)
         self.augment = bool(augment)
+        self.depth_noise_std_ratio = float(depth_noise_std_ratio)
         self.cache_episodes = max(1, int(cache_episodes))
         if self.sequence_length <= 0 or self.burn_in < 0 or self.stride <= 0:
             raise ValueError("invalid sequence_length/burn_in/stride")
@@ -451,7 +456,36 @@ class V25SequenceDataset(Dataset):
         # and normalized.
         depth_m = image.astype(np.float32) / 65535.0 * float(self.max_depth_m)
         depth_m[image == 0] = float(self.max_depth_m)
-        return np.clip(depth_m, 0.0, self.max_depth_m) / self.max_depth_m
+        norm = np.clip(depth_m, 0.0, self.max_depth_m) / self.max_depth_m
+        # D435i sim-to-real depth noise applied at TRAINING time only (the
+        # dataset stores CLEAN depth, so the noise level stays tunable and
+        # the clean data is reusable): multiplicative Gaussian with
+        # sigma = depth_noise_std_ratio * norm (0.02 = D435i <2% @2m;
+        # depth_m = norm * max_depth_m so the ratio carries over linearly).
+        # Applied at SENSOR resolution before the downscale; invalid pixels
+        # (image == 0, masked to the far marker) keep the far marker.
+        # Independent of mirror_augmentation; the val loader passes 0.
+        if self.depth_noise_std_ratio > 0.0:
+            valid = image > 0
+            sigma = self.depth_noise_std_ratio * norm
+            noise = np.random.normal(
+                0.0, 1.0, norm.shape).astype(np.float32) * sigma
+            norm = np.clip(norm + noise, 0.0, 1.0)
+            norm[~valid] = 1.0
+        # PERF: the policy backbone consumes a 90x60 image, so downscale the
+        # 640x360 camera frame right after decoding.  Feeding the full
+        # resolution through the DataLoader (collate + GPU transfer + the
+        # model's F.interpolate) made every training batch ~57x larger than
+        # needed and kept the GPU at ~15% while the CPU burned (measured:
+        # first epoch still incomplete after 20+ min).  INTER_LINEAR matches
+        # the model's bilinear resize.
+        if norm.shape[1] != 90 or norm.shape[0] != 60:
+            if cv2 is not None:
+                norm = cv2.resize(norm, (90, 60),
+                                  interpolation=cv2.INTER_LINEAR)
+            else:  # pragma: no cover
+                norm = np.asarray(Image.fromarray(norm).resize((90, 60)))
+        return norm
 
     def __getitem__(self, index: int) -> Dict[str, object]:
         window = self.windows[index]
@@ -621,7 +655,8 @@ class Macro5HzSequenceDataset(Dataset):
                  sequence_length: int = 16, burn_in: int = 4,
                  stride: Optional[int] = None, max_depth_m: float = 5.0,
                  augment: bool = False, cache_episodes: int = 8,
-                 stateful: bool = False):
+                 stateful: bool = False,
+                 depth_noise_std_ratio: float = 0.0):
         self.episodes = list(episodes)
         self.sequence_length = int(sequence_length)
         self.burn_in = int(burn_in)
@@ -632,6 +667,7 @@ class Macro5HzSequenceDataset(Dataset):
         self.total_length = self.context_burn_in + self.sequence_length
         self.max_depth_m = float(max_depth_m)
         self.augment = bool(augment)
+        self.depth_noise_std_ratio = float(depth_noise_std_ratio)
         self.cache_episodes = max(1, int(cache_episodes))
         if self.sequence_length <= 0 or self.burn_in < 0 or self.stride <= 0:
             raise ValueError("invalid macro sequence_length/burn_in/stride")
@@ -730,8 +766,9 @@ class Macro5HzSequenceDataset(Dataset):
             should_flip = random.random() < 0.5
         if self.augment and should_flip:
             depth = depth[:, :, :, ::-1].copy()
-            # gravity-y, velocity-y and original-goal-y are the lateral axes.
-            state[:, [1, 4, 8]] *= -1.0
+            # 7-D macro state: gravity-y (1) and original-goal-y (4) are the
+            # lateral axes; velocity/yaw_rate were removed (R31).
+            state[:, [1, 4]] *= -1.0
             macro_direction[:, 1] *= -1.0
             left_idx = MACRO_TYPE_TO_INDEX["TURN_LEFT"]
             right_idx = MACRO_TYPE_TO_INDEX["TURN_RIGHT"]
@@ -835,16 +872,18 @@ def build_dataloaders(dataset_root: Union[str, Path], batch_size: int = 8,
                       seed: int = 1337, workers: int = 0,
                       balanced_sampling: bool = True,
                       verify_depth: bool = True, stateful: bool = True,
-                      mirror_augmentation: bool = False):
+                      mirror_augmentation: bool = False,
+                      depth_noise_std_ratio: float = 0.02):
     episodes = discover_committed_episodes(dataset_root, verify_depth=verify_depth)
     train_eps, val_eps = split_episodes(episodes, val_fraction, seed)
     train_ds = V25SequenceDataset(
         train_eps, sequence_length, burn_in, stride,
         augment=mirror_augmentation,
-        stateful=stateful)
+        stateful=stateful,
+        depth_noise_std_ratio=depth_noise_std_ratio)
     val_ds = V25SequenceDataset(
         val_eps, sequence_length, burn_in, stride, augment=False,
-        stateful=stateful)
+        stateful=stateful, depth_noise_std_ratio=0.0)
     if stateful:
         if balanced_sampling:
             warnings.warn(
@@ -879,7 +918,8 @@ def build_macro_dataloaders(dataset_root: Union[str, Path], batch_size: int = 8,
                             workers: int = 0,
                             balanced_sampling: bool = True,
                             verify_depth: bool = True, stateful: bool = True,
-                            mirror_augmentation: bool = False):
+                            mirror_augmentation: bool = False,
+                            depth_noise_std_ratio: float = 0.02):
     """Build leakage-free 5 Hz loaders from real macro decision rows.
 
     ``discover_committed_episodes`` performs the complete v25 legality audit;
@@ -892,10 +932,11 @@ def build_macro_dataloaders(dataset_root: Union[str, Path], batch_size: int = 8,
     train_eps, val_eps = split_episodes(episodes, val_fraction, seed)
     train_ds = Macro5HzSequenceDataset(
         train_eps, sequence_length, burn_in, stride,
-        augment=mirror_augmentation, stateful=stateful)
+        augment=mirror_augmentation, stateful=stateful,
+        depth_noise_std_ratio=depth_noise_std_ratio)
     val_ds = Macro5HzSequenceDataset(
         val_eps, sequence_length, burn_in, stride,
-        augment=False, stateful=stateful)
+        augment=False, stateful=stateful, depth_noise_std_ratio=0.0)
     if stateful:
         if balanced_sampling:
             warnings.warn(

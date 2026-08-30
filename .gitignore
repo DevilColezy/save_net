@@ -24,6 +24,10 @@ runs/
 tensorboard/
 *.npy
 
+# ── 发布模型（解除忽略，允许上传 git）───────────────────────────
+!released_models/
+!released_models/*.pt
+
 # ── 编辑器 / 系统 ────────────────────────────────────────────────
 .vscode/
 .idea/
