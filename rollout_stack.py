@@ -89,9 +89,11 @@ from rollout_macro_student import (  # noqa: E402
 try:
     import il_common
     import il_dynamics
+    import il_config
 except ImportError as e:  # pragma: no cover
     il_common = None
     il_dynamics = None
+    il_config = None
     _IL_IMPORT_ERROR: Optional[ImportError] = e
 else:
     _IL_IMPORT_ERROR = None
@@ -890,8 +892,8 @@ def main() -> None:
     # v3 scenes include outdoor INDUSTRIAL (x[-22,22] y[-10,30]) walls.
     # Outdoor flies HIGH (z=14) with 16 m obstacles; indoor stays at z=2.
     if v3_bounds and a.scene_id == 0:
-        ws_bounds = (-20.0, 20.0, -8.0, 29.0, 13.8, 14.2)
-        obs_bounds = (-22.0, 22.0, -10.0, 30.0, 0.0, 20.0)
+        ws_bounds = (-28.0, 28.0, -28.0, 30.0, 13.8, 14.2)
+        obs_bounds = (-28.0, 28.0, -28.0, 30.0, 0.0, 20.0)
     elif v3_bounds:
         ws_bounds = (-20.0, 20.0, -8.0, 29.0, 1.8, 2.2)
         obs_bounds = (-22.0, 22.0, -10.0, 30.0, 0.0, 8.0)
@@ -961,9 +963,20 @@ def main() -> None:
         expert, params, _minb, _maxb, depth_cfg = load_expert_stack(
             a.expert_config)
         depth_t_bc = tuple(float(v) for v in depth_cfg["t_bc"])
+    elif a.expert_config:
+        # Even without an expert stack the camera extrinsic T_BC must match
+        # the collection/training recipe.  Parse only the YAML (no .so).
+        try:
+            _cfg = il_config.load_config(a.expert_config)
+            _tbc = _cfg["global"]["depth"].get("t_bc")
+            if _tbc:
+                depth_t_bc = tuple(float(v) for v in _tbc)
+        except Exception:
+            depth_t_bc = ()
     if not depth_t_bc:
-        depth_t_bc = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                      1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        # Single-source default camera->body matrix (identical to the one
+        # injected into every collection config): camera 0.15 m forward.
+        depth_t_bc = tuple(il_config.DEFAULT_T_BC)
 
     print("=" * 70)
     print("Unified stack comparison (4 stacks x %d scenes)" % len(selected_tasks))
@@ -975,6 +988,7 @@ def main() -> None:
         print(f"  Expert .so:     {getattr(__import__('_il_hierarchical_expert', fromlist=['EXPERT_REVISION']), 'EXPERT_REVISION', '<n/a>')}")
     print(f"  Stacks:         {', '.join(stacks)}")
     print(f"  Tasks:          {', '.join(t.name for t in selected_tasks)}")
+    print(f"  T_BC (cam->body): {depth_t_bc}")
     print("=" * 70)
 
     total_episodes = len(stacks) * len(selected_tasks) * a.repeats
