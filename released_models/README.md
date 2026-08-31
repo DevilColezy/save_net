@@ -1,13 +1,20 @@
 # Released Models — 分层飞行专家学生（30Hz + 5Hz）
 
-本目录发布两个最新训练的深度-控制学生模型，用于模仿 C++ 分层专家
-（`HierarchicalExpert`）的飞行策略。两个模型都是 **schema v25** 格式的因果
+本目录发布最新训练的深度-控制学生模型，用于模仿 C++ 分层专家
+（`HierarchicalExpert`）的飞行策略。模型都是 **schema v25** 格式的因果
 LSTM 策略，输入一张 D435i 深度图 + 7 维状态，输出机体系（FLU）控制。
 
 | 文件 | 架构 | 职责 | 训练数据 |
 |------|------|------|----------|
-| `30hz_v31_v3complete_mirror_nonoise_best.pt` | `ViTFlyLSTMPolicy` | **30 Hz 局部避障学生**（低层执行器） | `il_data_d435i_col_v3_complete`（554 ep / 46 scenes / 234,903 frames） |
+| `30hz_v32_origgoal_v3complete_mirror_nonoise_best.pt` | `ViTFlyLSTMPolicy` | **30 Hz 端到端学生**（原始导航目标，`student30` 栈默认） | `il_data_d435i_col_v3_complete`（554 ep / 46 scenes / 234,903 frames） |
+| `30hz_v31_v3complete_mirror_nonoise_best.pt` | `ViTFlyLSTMPolicy` | **30 Hz 局部避障学生**（有效目标，分层栈低层执行器） | 同一数据集 |
 | `5hz_macro_v5_v3complete_mirror_nonoise_best.pt` | `MacroPlannerPolicy` | **5 Hz 上层规划学生**（宏观接管/绕障） | 同一数据集（39,371 个 5 Hz 决策帧） |
+
+> **v32 vs v31**：`v32_origgoal` 是原始导航目标消融——30 Hz 学生直接吃
+> 原始导航目标（`navigation_goal_*`），自己规划整个绕行，不依赖 5 Hz 修正，
+> 适合 `stack:=student30` 单模型部署（长墙/长绕行场景表现最好）。
+> `v31` 输入的是 5 Hz 修正后的有效目标，适合 `stack:=student5_student30`
+> 分层部署。两者 7-D 字段顺序一致，checkpoint 可互换加载（区别在训练目标源）。
 
 两个模型使用**相同的训练配方**：镜像增强开启、深度噪声关闭（采集存的是干净深度，
 噪声在部署/训练时按需叠加）、100 epoch、stateful truncated BPTT（LSTM 状态跨

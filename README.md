@@ -13,9 +13,11 @@ on the non-privileged contract written by `il_dataset` schema v25:
 - network: two-stage overlapping Mix-Transformer visual encoder, state MLP,
   and a two-layer LSTM inspired by ViTFly.
 
-> **最新发布模型**：两个最新训练的模型（30 Hz v31 + 5 Hz macro_v5）位于
-> [`released_models/`](released_models/README.md)，那里有完整的输入输出、
-> 深度/状态归一化、特殊语义（PASS/NORMAL/TURN 解码）与推理示例。
+> **最新发布模型**：最新训练的模型位于
+> [`released_models/`](released_models/README.md)：30 Hz 端到端学生
+> `30hz_v32_origgoal_v3complete_mirror_nonoise_best.pt`（原始导航目标，
+> `student30` 栈默认）与 `30hz_v31_v3complete_mirror_nonoise_best.pt`（有效目标，
+> 分层栈低层），加 5 Hz 上层 `5hz_macro_v5_v3complete_mirror_nonoise_best.pt`。
 
 `train.py` trains only the 30 Hz local policy.  `train_macro.py` trains the
 5 Hz macro policy from the same committed episodes.  The two trainers have
