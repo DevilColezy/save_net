@@ -248,6 +248,11 @@ class MacroPolicyConfig:
     stage_heads: Tuple[int, int] = (1, 2)
     sr_ratios: Tuple[int, int] = (8, 4)
     visual_dim: int = 256
+    # Visual-feature scale alignment with the 30 Hz student (2026-09-02): the
+    # 5 Hz macro policy now multiplies its visual embedding by the same 3.0
+    # factor so the depth branch drives the recurrent state as strongly as
+    # the state branch, mirroring the 30 Hz ViTFlyPolicy.
+    visual_scale: float = 3.0
     state_hidden_dim: int = 96
     recurrent_hidden_dim: int = 192
     recurrent_layers: int = 2
@@ -304,6 +309,7 @@ class MacroPlannerPolicy(nn.Module):
             sr_ratios=self.config.sr_ratios,
             visual_dim=self.config.visual_dim,
             dropout=self.config.dropout,
+            visual_scale=self.config.visual_scale,
         )
         self.visual = VisualEncoder(visual_cfg)
         self.state_encoder = nn.Sequential(
@@ -351,6 +357,7 @@ class MacroPlannerPolicy(nn.Module):
             frames, size=(self.config.image_height, self.config.image_width),
             mode="bilinear", align_corners=False)
         visual = self.visual(frames).reshape(b, t, -1)
+        visual = visual * self.config.visual_scale
         state_features = self.state_encoder(
             state.reshape(b * t, -1)).reshape(b, t, -1)
         recurrent, hidden_out = self.recurrent(

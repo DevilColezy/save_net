@@ -308,6 +308,58 @@ def build_v3_task_registry(scene_id: int) -> Dict[str, RolloutTask]:
     return tasks, flight_z
 
 
+_UNIFIED_BENCH_PATH = _THIS_DIR / "gen_unified_benchmark.py"
+
+
+def _load_unified_benchmark_module():
+    if not _UNIFIED_BENCH_PATH.is_file():
+        raise RuntimeError("gen_unified_benchmark.py not found")
+    spec = importlib.util.spec_from_file_location(
+        "_gen_unified_benchmark", str(_UNIFIED_BENCH_PATH))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_unified_task_registry(scene_id: int):
+    """Unified 6-scale benchmark (gen_unified_benchmark.py).  scene_id 1 =
+    warehouse (small/medium/large/mixed), 0 = high-altitude (x-large/x-mixed).
+    Returns (task_registry, flight_z)."""
+    if int(scene_id) not in (0, 1):
+        raise ValueError(
+            "unified scene set needs --scene-id 0 (high-altitude) or 1 "
+            "(warehouse), got %s" % scene_id)
+    module = _load_unified_benchmark_module()
+    flight_z = 14.0 if scene_id == 0 else 2.0
+    obstacle_h = 18.0 if scene_id == 0 else 8.0
+    tasks: Dict[str, RolloutTask] = {}
+    for scene_index, sc in enumerate(module.generate_scenes()):
+        if sc["scene"] != int(scene_id):
+            continue
+        obstacles = []
+        for o in sc["obstacles"]:
+            if len(o) >= 5 and o[3] > 0.0 and o[4] > 0.0:
+                obstacles.append(Cylinder(float(o[0]), float(o[1]), float(o[2]),
+                                          height=obstacle_h,
+                                          half_w=float(o[3]), half_h=float(o[4])))
+            else:
+                obstacles.append(Cylinder(float(o[0]), float(o[1]), float(o[2]),
+                                          height=obstacle_h))
+        obstacles = tuple(obstacles)
+        for (sx, sy, gx, gy, label) in sc["tasks"]:
+            tasks[label] = RolloutTask(
+                name=label,
+                description="%s %s" % (sc["scale"], sc["density_key"]),
+                start=(float(sx), float(sy), flight_z),
+                goal=(float(gx), float(gy), flight_z),
+                start_yaw=0.0, obstacles=obstacles,
+                suite="unified", scene_id=scene_index)
+    if not tasks:
+        raise RuntimeError("unified scene set: no tasks for scene_id %s"
+                           % scene_id)
+    return tasks, flight_z
+
+
 def build_big8_task_registry() -> Dict[str, RolloutTask]:
     """Single r=8 m cylinder at the scene centre with two crossing tasks.
 
@@ -505,6 +557,21 @@ def run_stack_rollout(
     dyn.reset(sp.copy(), syaw, np.zeros(3), np.zeros(3))
     veh = il_common.make_depth_vehicle(
         ros_pos=sp.copy().tolist(), yaw=syaw, depth_cfg=dc)
+    # First hide every obstacle slot so Unity tears down the PREVIOUS task's
+    # collision bodies. Each slot keeps its OWN prefab: AvoidBench never swaps
+    # the prefab of an existing ID, so hiding via a shared "Object" prefab
+    # would permanently re-type wall slots (they would never render again).
+    hide = [{
+        "ID": o["ID"],
+        "prefabID": o["prefabID"],
+        "position": [3000.0 + i, -1000.0, 3000.0],
+        "rotation": [0.0, 0.0, 0.0, 1.0],
+        "size": [0.01, 0.01, 0.01],
+    } for i, o in enumerate(obstacles)]
+    bridge.send_pose({"scene_id": scene_id, "frame_id": gid,
+                      "vehicles": [veh], "objects": hide})
+    gid += 1
+    time.sleep(0.3)
     st = {"scene_id": scene_id, "frame_id": gid,
           "vehicles": [veh], "objects": obstacles}
     bridge.send_pose(st)
@@ -849,11 +916,13 @@ def main() -> None:
     p.add_argument("--tasks", default="all",
                    help="Comma-separated task names or 'all'.")
     p.add_argument("--scene-set", default="stack",
-                   choices=["stack", "4level", "v3"],
+                   choices=["stack", "4level", "v3", "unified"],
                    help="stack = 30 synthetic comparison scenes; "
                         "4level = collection-mirror 4-level scenes + big8; "
                         "v3 = redesigned rollout scenes (--scene-id 1 indoor "
-                        "WAREHOUSE / 0 outdoor INDUSTRIAL, min gap 1.6 m).")
+                        "WAREHOUSE / 0 outdoor INDUSTRIAL, min gap 1.6 m); "
+                        "unified = 6-scale benchmark (--scene-id 1 warehouse "
+                        "/ 0 high-altitude).")
     p.add_argument("--list-tasks", action="store_true")
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--pub-port", default="10253")
@@ -880,6 +949,7 @@ def main() -> None:
     a = p.parse_args()
 
     v3_bounds = False
+    unified_bounds = False
     v3_flight_z = 2.0
     if a.scene_set == "4level":
         task_registry = build_4level_task_registry()
@@ -887,11 +957,21 @@ def main() -> None:
     elif a.scene_set == "v3":
         task_registry, v3_flight_z = build_v3_task_registry(a.scene_id)
         v3_bounds = True
+    elif a.scene_set == "unified":
+        task_registry, v3_flight_z = build_unified_task_registry(a.scene_id)
+        unified_bounds = True
     else:
         task_registry = build_stack_task_registry()
     # v3 scenes include outdoor INDUSTRIAL (x[-22,22] y[-10,30]) walls.
     # Outdoor flies HIGH (z=14) with 16 m obstacles; indoor stays at z=2.
-    if v3_bounds and a.scene_id == 0:
+    if unified_bounds:
+        if a.scene_id == 0:
+            ws_bounds = (-18.0, 18.0, 0.0, 72.0, 13.8, 14.2)
+            obs_bounds = (-19.0, 19.0, -1.0, 76.0, 0.0, 20.0)
+        else:
+            ws_bounds = (-9.0, 12.0, 0.0, 34.0, 1.8, 2.2)
+            obs_bounds = (-10.0, 13.0, -1.0, 35.0, 0.0, 10.0)
+    elif v3_bounds and a.scene_id == 0:
         ws_bounds = (-28.0, 28.0, -28.0, 30.0, 13.8, 14.2)
         obs_bounds = (-28.0, 28.0, -28.0, 30.0, 0.0, 20.0)
     elif v3_bounds:
@@ -900,11 +980,13 @@ def main() -> None:
     else:
         ws_bounds = None
         obs_bounds = None
+    min_gap = 0.5 if unified_bounds else (1.6 if v3_bounds else 1.20)
+    wall_tol = 0.1 if (v3_bounds or unified_bounds) else 0.0
     validate_task_registry(
         task_registry, drone_radius=0.30, safety_margin=0.0,
-        minimum_surface_gap_m=1.6 if v3_bounds else 1.20,
+        minimum_surface_gap_m=min_gap,
         workspace_bounds=ws_bounds, obstacle_bounds=obs_bounds,
-        wall_touch_tolerance_m=0.1 if v3_bounds else 0.0)
+        wall_touch_tolerance_m=wall_tol)
     if a.list_tasks:
         for task in task_registry.values():
             print(f"  {task.name:<12} {task.description}")
@@ -1018,7 +1100,12 @@ def main() -> None:
 
     results: List[EpisodeResult] = []
     gid = 0
-    object_slots = max(len(t.obstacles) for t in task_registry.values())
+    box_slots = max(
+        sum(1 for o in t.obstacles if o.is_box)
+        for t in task_registry.values())
+    cyl_slots = max(
+        sum(1 for o in t.obstacles if not o.is_box)
+        for t in task_registry.values())
     plan = [(s, t, ri) for s in stacks for t in selected_tasks
             for ri in range(a.repeats)]
     for ep, (stack, task, repeat_index) in enumerate(plan):
@@ -1030,7 +1117,7 @@ def main() -> None:
         time.sleep(0.1)
         sp = np.asarray(task.start, dtype=np.float64)
         gp = np.asarray(task.goal, dtype=np.float64)
-        obs = task_to_unity_objects(task, object_slots)
+        obs = task_to_unity_objects(task, box_slots, cyl_slots)
         cfg = StackRolloutConfig(
             stack=stack, checkpoint=a.checkpoint, model_file=a.model_file,
             macro_checkpoint=a.macro_checkpoint or "",

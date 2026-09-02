@@ -118,7 +118,9 @@ def save_ablation_checkpoint(path: Path, model: ViTFlyLSTMPolicy, optimizer,
                      best_val, train_eps, val_eps, args)
     ck = torch.load(str(path), map_location="cpu", weights_only=False)
     ck["goal_source"] = "original_navigation_goal"
-    ck["ablation"] = "30hz_original_goal_no_5hz_correction"
+    ck["ablation"] = ("30hz_original_goal_no_mode_weighting"
+                      if getattr(args, "no_mode_weighting", False)
+                      else "30hz_original_goal_no_5hz_correction")
     torch.save(ck, str(path))
 
 
@@ -147,6 +149,23 @@ def build_parser() -> argparse.ArgumentParser:
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-balanced-sampling", action="store_true")
+    parser.add_argument(
+        "--no-mode-weighting", action="store_true",
+        help="ablation: uniform frame loss (disable hierarchical-mode label "
+             "weighting)")
+    parser.add_argument(
+        "--local-avoidance-weight", type=float, default=2.0,
+        help="loss weight multiplier for local_avoidance frames "
+             "(hierarchical_mode==1, default 2.0)")
+    parser.add_argument(
+        "--clearance-weight", type=float, default=0.0,
+        help="weight for clearance-aware speed loss (0 disables; "
+             "penalizes target speed exceeding the physically stoppable "
+             "speed given the nearest obstacle distance)")
+    parser.add_argument(
+        "--clearance-margin", type=float, default=0.3,
+        help="safety margin (m) subtracted from min depth in the "
+             "clearance loss (default 0.3)")
     parser.add_argument("--mirror-augmentation", action="store_true")
     parser.add_argument("--depth-noise-std-ratio", type=float, default=0.02)
     parser.add_argument("--stateless-windows", action="store_true")
@@ -228,11 +247,19 @@ def main() -> None:
         train_metrics = run_epoch(
             model, train_loader, device, optimizer, scaler, scheduler, amp,
             args.grad_clip, args.smoothness_weight,
-            stateful=not args.stateless_windows)
+            stateful=not args.stateless_windows,
+            mode_weighting=not args.no_mode_weighting,
+            local_avoidance_weight=args.local_avoidance_weight,
+            clearance_weight=args.clearance_weight,
+            clearance_margin=args.clearance_margin)
         val_metrics = run_epoch(
             model, val_loader, device,
             smoothness_weight=args.smoothness_weight,
-            stateful=not args.stateless_windows)
+            stateful=not args.stateless_windows,
+            mode_weighting=not args.no_mode_weighting,
+            local_avoidance_weight=args.local_avoidance_weight,
+            clearance_weight=args.clearance_weight,
+            clearance_margin=args.clearance_margin)
         print("epoch %03d train=%s val=%s" %
               (epoch + 1, json.dumps(train_metrics, sort_keys=True),
                json.dumps(val_metrics, sort_keys=True)))

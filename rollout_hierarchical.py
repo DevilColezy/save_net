@@ -1182,7 +1182,12 @@ def main() -> None:
 
     results: List[EpisodeResult] = []
     gid = 0
-    object_slots = max(len(task.obstacles) for task in task_registry.values())
+    box_slots = max(
+        sum(1 for o in task.obstacles if o.is_box)
+        for task in task_registry.values())
+    cyl_slots = max(
+        sum(1 for o in task.obstacles if not o.is_box)
+        for task in task_registry.values())
     episode_plan = [
         (task, repeat_index)
         for task in selected_tasks
@@ -1197,7 +1202,7 @@ def main() -> None:
         time.sleep(0.1)
         sp = np.asarray(task.start, dtype=np.float64)
         gp = np.asarray(task.goal, dtype=np.float64)
-        obs = task_to_unity_objects(task, object_slots)
+        obs = task_to_unity_objects(task, box_slots, cyl_slots)
 
         # ── Schema-v25 episode output (interactive_trajectory_debug) ──
         schema_writer: Optional[SchemaV25EpisodeWriter] = None

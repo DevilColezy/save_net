@@ -100,25 +100,35 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def compute_loss(normalized_prediction: torch.Tensor,
                  normalized_target: torch.Tensor, loss_mask: torch.Tensor,
-                 hierarchical_mode: torch.Tensor, smoothness_weight: float = 0.05
+                 hierarchical_mode: torch.Tensor, smoothness_weight: float = 0.05,
+                 mode_weighting: bool = True,
+                 local_avoidance_weight: float = 2.0,
+                 depth: Optional[torch.Tensor] = None,
+                 clearance_weight: float = 0.0,
+                 clearance_margin: float = 0.3,
+                 max_depth_m: float = 5.0,
+                 max_accel: float = 4.0
                  ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     # Rare decision states deserve more weight without exposing them to the
     # policy: hierarchical_mode is used only by the loss.
     # local_avoidance / macro_* / turn_to_target / blocked -> 2.0x;
-    # goal_capture -> 1.5x.
+    # goal_capture -> 1.5x.  mode_weighting=False is the no-label-weighting
+    # ablation (uniform frame weighting).
     mode_weight = torch.ones_like(loss_mask)
-    mode_weight = torch.where(hierarchical_mode == 1, 2.0 * mode_weight,
-                              mode_weight)
-    mode_weight = torch.where(hierarchical_mode == 2, 2.0 * mode_weight,
-                              mode_weight)
-    mode_weight = torch.where(hierarchical_mode == 3, 2.0 * mode_weight,
-                              mode_weight)
-    mode_weight = torch.where(hierarchical_mode == 4, 2.0 * mode_weight,
-                              mode_weight)
-    mode_weight = torch.where(hierarchical_mode == 5, 2.0 * mode_weight,
-                              mode_weight)
-    mode_weight = torch.where(hierarchical_mode == 6, 1.5 * mode_weight,
-                              mode_weight)
+    if mode_weighting:
+        mode_weight = torch.where(hierarchical_mode == 1,
+                                  local_avoidance_weight * mode_weight,
+                                  mode_weight)
+        mode_weight = torch.where(hierarchical_mode == 2, 2.0 * mode_weight,
+                                  mode_weight)
+        mode_weight = torch.where(hierarchical_mode == 3, 2.0 * mode_weight,
+                                  mode_weight)
+        mode_weight = torch.where(hierarchical_mode == 4, 2.0 * mode_weight,
+                                  mode_weight)
+        mode_weight = torch.where(hierarchical_mode == 5, 2.0 * mode_weight,
+                                  mode_weight)
+        mode_weight = torch.where(hierarchical_mode == 6, 1.5 * mode_weight,
+                                  mode_weight)
     weighted_mask = loss_mask * mode_weight
     element = F.smooth_l1_loss(
         normalized_prediction, normalized_target, reduction="none", beta=0.1)
@@ -145,9 +155,38 @@ def compute_loss(normalized_prediction: torch.Tensor,
             pred_delta, target_delta, reduction="none", beta=0.05), pair_mask)
     else:
         smooth = velocity.new_zeros(())
-    total = velocity + yaw + float(smoothness_weight) * smooth
+    clearance = velocity.new_zeros(())
+    if clearance_weight > 0.0 and depth is not None:
+        # ── clearance-aware speed loss ──────────────────────────────
+        # depth 归一化 [0,1]（0=近, 1=远）。每帧最近障碍距离决定物理可刹停的
+        # 安全速度上限 v_safe = sqrt(2*a*(d-margin))。对目标速度超出的部分施加
+        # ReLU 惩罚，让模型学会"离障碍越近飞得越慢"，解决 0.28 m 深度盲区下
+        # 2 m/s 巡航刹不住导致的碰撞。
+        # 只限制前向速度 vx：横向/垂直速度（vy/vz）是避障机动，减速会让绕行
+        # 大障碍时失去机动能力（large 尺度碰撞飙升的根源），所以不约束它们。
+        # 深度也只取正前方中心一片（避开侧面大障碍表面）：否则绕行大圆柱时
+        # 侧面表面占据大片近像素，v_safe 被压得过低，导致绕行犹豫/擦碰。
+        #
+        # BUGFIX (2026-09-01): 之前 violation 用的是 normalized_target（专家
+        # 速度，常量），对模型梯度恒为 0，clearance 项从未参与训练 —— 这正是
+        # v35/v36/v37 的 epoch-050 指标逐位相同、clearance_loss 却不同的原因。
+        # 改为惩罚模型的「输出速度」：损失是 (输入深度, 模型输出) 的纯函数，
+        # 推理时无任何隐藏改动，保持 depth→velocity 一致性；模型从自身看到的
+        # 深度序列学「离障碍多近就该飞多慢」，LSTM 时序结构自然学到提前刹车。
+        h, w = depth.shape[-2], depth.shape[-1]
+        center = depth[..., h // 4:3 * h // 4, w // 3:2 * w // 3]
+        d_min = center.reshape(*center.shape[:2], -1).min(dim=-1).values
+        d_min_m = d_min * max_depth_m
+        v_safe = torch.sqrt(
+            2.0 * max_accel * torch.clamp(d_min_m - clearance_margin, min=0.0))
+        speed_pred = torch.abs(
+            normalized_prediction[..., 0]) * float(COMMAND_SCALE[0])
+        violation = torch.relu(speed_pred - v_safe)
+        clearance = masked_mean(violation, loss_mask)
+    total = velocity + yaw + float(smoothness_weight) * smooth \
+        + float(clearance_weight) * clearance
     return total, {"velocity_loss": velocity, "yaw_loss": yaw,
-                   "smoothness_loss": smooth}
+                   "smoothness_loss": smooth, "clearance_loss": clearance}
 
 
 class Metrics:
@@ -204,7 +243,13 @@ def run_epoch(model: ViTFlyLSTMPolicy, loader: Iterable,
               device: torch.device, optimizer=None, scaler=None,
               scheduler=None, amp: bool = False, grad_clip: float = 1.0,
               smoothness_weight: float = 0.05,
-              stateful: bool = True) -> Dict[str, float]:
+              stateful: bool = True,
+              mode_weighting: bool = True,
+              local_avoidance_weight: float = 2.0,
+              clearance_weight: float = 0.0,
+              clearance_margin: float = 0.3,
+              max_depth_m: float = 5.0,
+              max_accel: float = 4.0) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
     metrics = Metrics()
@@ -221,7 +266,13 @@ def run_epoch(model: ViTFlyLSTMPolicy, loader: Iterable,
             loss, parts = compute_loss(
                 output.normalized_command, batch["target"],
                 batch["loss_mask"], batch["hierarchical_mode"],
-                smoothness_weight)
+                smoothness_weight, mode_weighting,
+                local_avoidance_weight=local_avoidance_weight,
+                depth=batch.get("depth"),
+                clearance_weight=clearance_weight,
+                clearance_margin=clearance_margin,
+                max_depth_m=max_depth_m,
+                max_accel=max_accel)
         if training:
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:

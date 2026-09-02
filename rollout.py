@@ -532,50 +532,88 @@ def validate_task_registry(
 
 
 def task_to_unity_objects(
-    task: RolloutTask, object_slots: int,
+    task: RolloutTask, box_slots: int, cyl_slots: int,
 ) -> List[Dict[str, Any]]:
-    """Convert a task to Unity objects and hide unused persistent slots."""
-    if len(task.obstacles) > object_slots:
+    """Convert a task to Unity objects using prefab-typed slot IDs.
+
+    AvoidBench's runtime ``Pose`` handler only creates/updates objects by ID
+    and never swaps the prefab of an existing ID. A single shared slot
+    namespace (``rollout_obstacle_*``) therefore sticks wall slots on the
+    ``Object`` prefab once a cylinder scene has claimed them — the walls
+    silently disappear while the Python-side AABB truth still reports them.
+
+    Slots are partitioned by prefab type (``rollout_box_*`` vs
+    ``rollout_cyl_*``) so no slot ever changes prefab; unused slots of each
+    type keep their own prefab and are parked far outside the render volume.
+    """
+    boxes = [o for o in task.obstacles if o.is_box]
+    cylinders = [o for o in task.obstacles if not o.is_box]
+    if len(boxes) > box_slots:
         raise ValueError(
-            f"Task {task.name} has {len(task.obstacles)} obstacles, "
-            f"but only {object_slots} slots")
+            f"Task {task.name} has {len(boxes)} box obstacles, "
+            f"but only {box_slots} box slots")
+    if len(cylinders) > cyl_slots:
+        raise ValueError(
+            f"Task {task.name} has {len(cylinders)} cylinder obstacles, "
+            f"but only {cyl_slots} cylinder slots")
     result: List[Dict[str, Any]] = []
-    for index in range(object_slots):
-        if index < len(task.obstacles):
-            obstacle = task.obstacles[index]
-            position = [
-                float(obstacle.x),
-                float(obstacle.base_z + obstacle.height / 2.0),
-                float(obstacle.y),
-            ]
-            if obstacle.is_box:
-                # AABB box (same prefab the collection pipeline uses).
-                prefab = "Transparen_Cube"
-                size = [
+
+    def _park(index: int, offset: float) -> List[float]:
+        # Far below every camera / collider / point-cloud sampling volume.
+        return [offset + index, -1000.0, offset + index]
+
+    for index in range(box_slots):
+        if index < len(boxes):
+            obstacle = boxes[index]
+            result.append({
+                "ID": f"rollout_box_{index:02d}",
+                "prefabID": "Transparen_Cube",
+                "position": [
+                    float(obstacle.x),
+                    float(obstacle.base_z + obstacle.height / 2.0),
+                    float(obstacle.y),
+                ],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "size": [
                     2.0 * float(obstacle.half_w),
                     float(obstacle.height),
                     2.0 * float(obstacle.half_h),
-                ]
-            else:
-                prefab = "Object"
-                size = [
+                ],
+            })
+        else:
+            result.append({
+                "ID": f"rollout_box_{index:02d}",
+                "prefabID": "Transparen_Cube",
+                "position": _park(index, 1000.0),
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "size": [0.01, 0.01, 0.01],
+            })
+    for index in range(cyl_slots):
+        if index < len(cylinders):
+            obstacle = cylinders[index]
+            result.append({
+                "ID": f"rollout_cyl_{index:02d}",
+                "prefabID": "Object",
+                "position": [
+                    float(obstacle.x),
+                    float(obstacle.base_z + obstacle.height / 2.0),
+                    float(obstacle.y),
+                ],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "size": [
                     2.0 * float(obstacle.radius),
                     float(obstacle.height),
                     2.0 * float(obstacle.radius),
-                ]
+                ],
+            })
         else:
-            # Unity keeps dynamically created IDs alive. Moving every unused
-            # stable slot prevents geometry from a previous task leaking in.
-            position = [1000.0 + index, -1000.0, 1000.0]
-            size = [0.01, 0.01, 0.01]
-            prefab = "Object"
-        result.append({
-            "ID": f"rollout_obstacle_{index:02d}",
-            "prefabID": prefab,
-            "position": position,
-            "rotation": [0.0, 0.0, 0.0, 1.0],
-            "size": size,
-        })
+            result.append({
+                "ID": f"rollout_cyl_{index:02d}",
+                "prefabID": "Object",
+                "position": _park(index, 2000.0),
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "size": [0.01, 0.01, 0.01],
+            })
     return result
 
 
@@ -1301,7 +1339,12 @@ def main() -> None:
     dyn = il_dynamics.FlightmareDynamicsBackend(dycfg)
     results: List[EpisodeResult] = []
     gid = 0
-    object_slots = max(len(task.obstacles) for task in task_registry.values())
+    box_slots = max(
+        sum(1 for o in task.obstacles if o.is_box)
+        for task in task_registry.values())
+    cyl_slots = max(
+        sum(1 for o in task.obstacles if not o.is_box)
+        for task in task_registry.values())
     episode_plan = [
         (task, repeat_index)
         for task in selected_tasks
@@ -1317,7 +1360,7 @@ def main() -> None:
         time.sleep(0.1)  # brief pause between episodes
         sp = np.asarray(task.start, dtype=np.float64)
         gp = np.asarray(task.goal, dtype=np.float64)
-        obs = task_to_unity_objects(task, object_slots)
+        obs = task_to_unity_objects(task, box_slots, cyl_slots)
         print(f"\n{'-'*60}")
         print(
             f"Episode {ep+1}/{len(episode_plan)}  "
